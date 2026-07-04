@@ -91,6 +91,10 @@ impl TunProxyEngine {
         stop_tun_proxy_engine(self)
     }
 
+    pub fn cancel(&self) {
+        cancel_tun_proxy_engine(self)
+    }
+
     pub fn status(&self) -> TunProxyStatus {
         tun_proxy_engine_status(self)
     }
@@ -102,7 +106,7 @@ impl TunProxyEngine {
 
 impl Drop for TunProxyEngine {
     fn drop(&mut self) {
-        let _ = self.stop();
+        self.cancel();
     }
 }
 
@@ -127,7 +131,8 @@ fn start_tun_proxy_engine(config: TunProxyConfig) -> AtrResult<TunProxyEngine> {
             {
                 Ok(runtime) => runtime,
                 Err(err) => {
-                    let error = AtrError::Internal(format!("failed to create tun2proxy runtime: {err}"));
+                    let error =
+                        AtrError::Internal(format!("failed to create tun2proxy runtime: {err}"));
                     let _ = startup_tx.send(Err(error.clone()));
                     *thread_result.lock().unwrap() = Some(Err(error));
                     return;
@@ -173,7 +178,7 @@ fn start_tun_proxy_engine(_config: TunProxyConfig) -> AtrResult<TunProxyEngine> 
 #[cfg(feature = "tun2proxy")]
 fn stop_tun_proxy_engine(engine: &TunProxyEngine) -> AtrResult<()> {
     engine.inner.shutdown.cancel();
-    join_worker_if_finished(engine);
+    join_worker(engine);
     Ok(())
 }
 
@@ -181,6 +186,14 @@ fn stop_tun_proxy_engine(engine: &TunProxyEngine) -> AtrResult<()> {
 fn stop_tun_proxy_engine(_engine: &TunProxyEngine) -> AtrResult<()> {
     Ok(())
 }
+
+#[cfg(feature = "tun2proxy")]
+fn cancel_tun_proxy_engine(engine: &TunProxyEngine) {
+    engine.inner.shutdown.cancel();
+}
+
+#[cfg(not(feature = "tun2proxy"))]
+fn cancel_tun_proxy_engine(_engine: &TunProxyEngine) {}
 
 #[cfg(feature = "tun2proxy")]
 fn tun_proxy_engine_status(engine: &TunProxyEngine) -> TunProxyStatus {
@@ -215,6 +228,11 @@ fn join_worker_if_finished(engine: &TunProxyEngine) {
     if engine.inner.result.lock().unwrap().is_none() {
         return;
     }
+    join_worker(engine);
+}
+
+#[cfg(feature = "tun2proxy")]
+fn join_worker(engine: &TunProxyEngine) {
     if let Some(worker) = engine.inner.worker.lock().unwrap().take() {
         let _ = worker.join();
     }
@@ -265,8 +283,7 @@ fn build_tun2proxy_args(config: &TunProxyConfig) -> AtrResult<tun2proxy::Args> {
         argv.push(cidr.clone());
     }
 
-    tun2proxy::Args::try_parse_from(argv)
-        .map_err(|err| AtrError::InvalidArgument(err.to_string()))
+    tun2proxy::Args::try_parse_from(argv).map_err(|err| AtrError::InvalidArgument(err.to_string()))
 }
 
 #[cfg(feature = "tun2proxy")]

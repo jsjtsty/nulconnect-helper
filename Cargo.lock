@@ -1389,6 +1389,7 @@ name = "nulconnect-tun"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "reqwest",
  "rsa",
  "serde",
