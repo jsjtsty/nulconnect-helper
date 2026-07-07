@@ -1,6 +1,6 @@
 [package]
 name = "nulconnect-tun"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 
 [lib]
@@ -26,7 +26,7 @@ thiserror = "2"
 tun-rs = { version = "2", features = ["interruptible"] }
 url = "2"
 libc = "0.2"
-reatrust = { path = "../libreatrust", features = ["verbose-logs"] }
+reatrust = { path = "../libreatrust" }
 
 [features]
 default = []

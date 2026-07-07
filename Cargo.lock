@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "nulconnect-tun"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "base64",
  "libc",
