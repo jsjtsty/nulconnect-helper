@@ -1,11 +1,14 @@
+use base64::Engine as _;
 use nulconnect_tun::{
-    AtrError, AtrResult, TunDnsStrategy, TunLogLevel, TunProxyConfig, TunProxyEngine,
+    AtrError, AtrResult, VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnSessionMaterial,
 };
+use reatrust::{ClientConfig, parse_resource_bytes};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -13,33 +16,62 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use url::Url;
 
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SOCKET_PATH: &str = "/var/run/nulconnect-helper.sock";
 const DEFAULT_STATE_DIR: &str = "/Library/Application Support/NulConnect";
 
+macro_rules! helper_log {
+    ($($arg:tt)*) => {
+        eprintln!("[{}] {}", now_unix_secs(), format_args!($($arg)*));
+    };
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct HelperConfig {
-    proxy_url: String,
+    client: HelperClientConfig,
+    session: HelperSessionMaterial,
+    resource_bytes: String,
+    service_host: String,
     tun_name: Option<String>,
-    dns_strategy: String,
     dns_addr: String,
-    virtual_dns_pool: String,
-    bypass_cidrs: Vec<String>,
     #[serde(default)]
     managed_route_cidrs: Vec<String>,
     #[serde(default)]
     managed_domains: Vec<String>,
     mtu: u16,
-    tcp_timeout_secs: u64,
-    udp_timeout_secs: u64,
-    max_sessions: usize,
     setup_routes: bool,
-    ipv6_enabled: bool,
-    packet_information: bool,
     exit_on_fatal_error: bool,
-    verbosity: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HelperClientConfig {
+    server_host: String,
+    server_port: u16,
+    user_agent: String,
+    connect_timeout_ms: u64,
+    io_timeout_ms: u64,
+    node_probe_timeout_ms: u64,
+    allow_insecure_tls: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HelperSessionMaterial {
+    username: String,
+    sid: String,
+    device_id: String,
+    connection_id: String,
+    sign_key_hex: String,
+    #[serde(default)]
+    cookies: Vec<HelperCookieRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HelperCookieRecord {
+    host: String,
+    scheme: String,
+    name: String,
+    value: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,7 +132,9 @@ struct HelperErrorResponse {
 
 struct HelperRuntime {
     state_dir: PathBuf,
-    tun_engine: Mutex<Option<TunProxyEngine>>,
+    tun_engine: Mutex<Option<VpnEngine>>,
+    tun_starting: Mutex<bool>,
+    tun_failure: Mutex<Option<String>>,
     shutting_down: Mutex<bool>,
 }
 
@@ -127,9 +161,17 @@ struct TunNetworkServiceSnapshot {
 }
 
 fn main() {
+    ignore_sigpipe();
     if let Err(err) = run() {
         eprintln!("{err}");
         std::process::exit(1);
+    }
+}
+
+fn ignore_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 }
 
@@ -170,6 +212,11 @@ fn run() -> AtrResult<()> {
 }
 
 fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
+    helper_log!(
+        "[NulConnect][Helper] serve: socket={} state_dir={}",
+        socket_path.display(),
+        state_dir.display()
+    );
     fs::create_dir_all(state_dir)?;
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
@@ -181,10 +228,13 @@ fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
     fs::set_permissions(socket_path, fs::Permissions::from_mode(0o777))?;
+    helper_log!("[NulConnect][Helper] serve: listening");
 
     let runtime = Arc::new(HelperRuntime {
         state_dir: state_dir.to_path_buf(),
         tun_engine: Mutex::new(None),
+        tun_starting: Mutex::new(false),
+        tun_failure: Mutex::new(None),
         shutting_down: Mutex::new(false),
     });
 
@@ -194,9 +244,16 @@ fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
         }
         match listener.accept() {
             Ok((stream, _addr)) => {
+                helper_log!("[NulConnect][Helper] serve: accepted client");
+                if let Err(err) = stream.set_nonblocking(false) {
+                    helper_log!("[NulConnect][Helper] accepted client set blocking failed: {err}");
+                    continue;
+                }
                 let worker_runtime = runtime.clone();
                 thread::spawn(move || {
-                    let _ = handle_client(stream, worker_runtime);
+                    if let Err(err) = handle_client(stream, worker_runtime) {
+                        helper_log!("[NulConnect][Helper] client handler failed: {err}");
+                    }
                 });
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -215,7 +272,15 @@ fn handle_client(mut stream: UnixStream, runtime: Arc<HelperRuntime>) -> AtrResu
     let reader_stream = stream.try_clone()?;
     let reader = BufReader::new(reader_stream);
     for line in reader.lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                helper_log!("[NulConnect][Helper] client read would block, waiting");
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(err) => return Err(AtrError::from(err)),
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -231,22 +296,46 @@ fn handle_client(mut stream: UnixStream, runtime: Arc<HelperRuntime>) -> AtrResu
                 }),
             },
         };
-        let data = serde_json::to_vec(&response)?;
-        stream.write_all(&data)?;
-        stream.write_all(b"\n")?;
+        if write_response(&mut stream, &response)? {
+            break;
+        }
     }
     Ok(())
 }
 
+fn write_response(stream: &mut UnixStream, response: &HelperResponse) -> AtrResult<bool> {
+    let data = serde_json::to_vec(response)?;
+    match stream
+        .write_all(&data)
+        .and_then(|_| stream.write_all(b"\n"))
+    {
+        Ok(()) => Ok(false),
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+            ) =>
+        {
+            helper_log!("[NulConnect][Helper] client disconnected before response was written");
+            Ok(true)
+        }
+        Err(err) => Err(AtrError::from(err)),
+    }
+}
+
 fn handle_request(request: HelperRequest, runtime: &Arc<HelperRuntime>) -> HelperResponse {
     let id = request.id;
+    helper_log!("[NulConnect][Helper] request: id={id}");
     let result = match request.command {
         HelperCommand::Version => Ok(json!({
             "version": HELPER_VERSION,
             "pid": std::process::id(),
         })),
         HelperCommand::Status => helper_status(runtime),
-        HelperCommand::StartTun { config } => start_tun(runtime, config),
+        HelperCommand::StartTun { config } => start_tun(runtime.clone(), config),
         HelperCommand::StopTun => stop_tun(runtime).map(|_| json!({ "status": "stopped" })),
         HelperCommand::SetSystemProxy {
             endpoint,
@@ -287,26 +376,32 @@ fn handle_request(request: HelperRequest, runtime: &Arc<HelperRuntime>) -> Helpe
 
 fn helper_status(runtime: &HelperRuntime) -> AtrResult<Value> {
     let tun_status = {
-        let mut guard = runtime.tun_engine.lock().unwrap();
-        if let Some(engine) = guard.as_ref() {
-            if let Some(result) = engine.take_result() {
-                *guard = None;
-                match result {
-                    Ok(sessions) => {
-                        write_tun_state(runtime, "stopped", None, Some(sessions))?;
-                        json!({ "status": "stopped", "sessions": sessions })
+        if *runtime.tun_starting.lock().unwrap() {
+            json!({ "status": "starting" })
+        } else if let Some(message) = runtime.tun_failure.lock().unwrap().clone() {
+            json!({ "status": "failed", "message": message })
+        } else {
+            let mut guard = runtime.tun_engine.lock().unwrap();
+            if let Some(engine) = guard.as_ref() {
+                if let Some(result) = engine.take_result() {
+                    *guard = None;
+                    match result {
+                        Ok(sessions) => {
+                            write_tun_state(runtime, "stopped", None, Some(sessions))?;
+                            json!({ "status": "stopped", "sessions": sessions })
+                        }
+                        Err(err) => {
+                            let message = err.to_string();
+                            write_tun_state(runtime, "failed", Some(&message), None)?;
+                            json!({ "status": "failed", "message": message })
+                        }
                     }
-                    Err(err) => {
-                        let message = err.to_string();
-                        write_tun_state(runtime, "failed", Some(&message), None)?;
-                        json!({ "status": "failed", "message": message })
-                    }
+                } else {
+                    json!({ "status": "running" })
                 }
             } else {
-                json!({ "status": "running" })
+                json!({ "status": "stopped" })
             }
-        } else {
-            json!({ "status": "stopped" })
         }
     };
 
@@ -318,26 +413,69 @@ fn helper_status(runtime: &HelperRuntime) -> AtrResult<Value> {
     }))
 }
 
-fn start_tun(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<Value> {
-    validate_local_proxy_url(&config.proxy_url)?;
-    let mut guard = runtime.tun_engine.lock().unwrap();
-    if guard.is_some() {
+fn start_tun(runtime: Arc<HelperRuntime>, config: HelperConfig) -> AtrResult<Value> {
+    {
+        let mut starting = runtime.tun_starting.lock().unwrap();
+        if *starting {
+            return Err(AtrError::InvalidState("tun is already starting".into()));
+        }
+        if runtime.tun_engine.lock().unwrap().is_some() {
+            return Err(AtrError::InvalidState("tun is already running".into()));
+        }
+        *starting = true;
+        *runtime.tun_failure.lock().unwrap() = None;
+    }
+    write_tun_state(&runtime, "starting", None, None)?;
+    helper_log!(
+        "[NulConnect][Helper][Tun] start accepted: server={}:{} dns={} routes={} domains={} mtu={}",
+        config.client.server_host,
+        config.client.server_port,
+        config.dns_addr,
+        config.managed_route_cidrs.len(),
+        config.managed_domains.len(),
+        config.mtu
+    );
+
+    thread::Builder::new()
+        .name("nulconnect-l3-start".to_string())
+        .spawn(move || {
+            helper_log!("[NulConnect][Helper][Tun] start worker: begin");
+            let result = start_tun_worker(&runtime, config);
+            *runtime.tun_starting.lock().unwrap() = false;
+            match result {
+                Ok(()) => {
+                    helper_log!("[NulConnect][Helper][Tun] start worker: running");
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    helper_log!("[NulConnect][Helper][Tun] start worker: failed: {message}");
+                    *runtime.tun_failure.lock().unwrap() = Some(message.clone());
+                    let _ = write_tun_state(&runtime, "failed", Some(&message), None);
+                }
+            }
+        })
+        .map_err(|err| AtrError::Internal(format!("failed to start TUN worker: {err}")))?;
+
+    Ok(json!({ "status": "starting" }))
+}
+
+fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<()> {
+    if runtime.tun_engine.lock().unwrap().is_some() {
         return Err(AtrError::InvalidState("tun is already running".into()));
     }
+    helper_log!("[NulConnect][Helper][Tun] worker: snapshot network state");
     log_tun_network_state("before start");
     snapshot_tun_network_state(&tun_network_snapshot_path(runtime))?;
-    eprintln!(
-        "[NulConnect][Helper][Tun] start: proxy={} dns={} strategy={} virtual_pool={} setup_routes={} bypass={} managed_routes={} managed_domains={}",
-        config.proxy_url,
+    helper_log!(
+        "[NulConnect][Helper][Tun] start: server={} dns={} setup_routes={} managed_routes={} managed_domains={}",
+        config.client.server_host,
         config.dns_addr,
-        config.dns_strategy,
-        config.virtual_dns_pool,
         config.setup_routes,
-        config.bypass_cidrs.len(),
         config.managed_route_cidrs.len(),
         config.managed_domains.len()
     );
-    let engine = match TunProxyEngine::start(config.clone().into_tun_proxy_config()?) {
+    helper_log!("[NulConnect][Helper][Tun] worker: creating L3 engine");
+    let engine = match VpnEngine::start(config.clone().into_vpn_engine_config()?) {
         Ok(engine) => engine,
         Err(err) => {
             let message = err.to_string();
@@ -347,26 +485,31 @@ fn start_tun(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<Value> 
             return Err(err);
         }
     };
-    *guard = Some(engine);
-    drop(guard);
+    helper_log!("[NulConnect][Helper][Tun] worker: L3 engine created");
     if let Err(err) = setup_managed_tun_routes(&config) {
+        helper_log!("[NulConnect][Helper][Tun] worker: route setup failed: {err}");
         restore_tun_network_after_stop(runtime);
-        let _ = stop_tun(runtime);
+        let _ = engine.stop();
         return Err(err);
     }
+    helper_log!("[NulConnect][Helper][Tun] worker: route setup complete");
     if let Err(err) = wait_for_tun_setup(&config) {
+        helper_log!("[NulConnect][Helper][Tun] worker: setup wait failed: {err}");
         restore_tun_network_after_stop(runtime);
-        let _ = stop_tun(runtime);
+        let _ = engine.stop();
         return Err(err);
     }
+    helper_log!("[NulConnect][Helper][Tun] worker: setup wait complete");
+    *runtime.tun_engine.lock().unwrap() = Some(engine);
     log_tun_network_state("after start");
     write_tun_state(runtime, "running", None, None)?;
-    Ok(json!({ "status": "running" }))
+    Ok(())
 }
 
 fn stop_tun(runtime: &HelperRuntime) -> AtrResult<()> {
-    eprintln!("[NulConnect][Helper][Tun] stop: requested");
+    helper_log!("[NulConnect][Helper][Tun] stop: requested");
     log_tun_network_state("before stop");
+    *runtime.tun_failure.lock().unwrap() = None;
     let mut guard = runtime.tun_engine.lock().unwrap();
     if let Some(engine) = guard.take() {
         engine.cancel();
@@ -382,40 +525,17 @@ fn restore_tun_network_after_stop(runtime: &HelperRuntime) {
     cleanup_tun_routes();
     cleanup_scoped_dns_resolvers();
     remove_global_dns_state();
-    if let Err(err) = restore_tun_network_state(&tun_network_snapshot_path(runtime)) {
-        eprintln!("[NulConnect][Helper][Tun] restore network snapshot failed: {err}");
-        reset_dns_to_default();
-    }
-    flush_dns_cache();
-}
-
-fn validate_local_proxy_url(value: &str) -> AtrResult<()> {
-    let url = Url::parse(value).map_err(|err| AtrError::InvalidArgument(err.to_string()))?;
-    match url.scheme() {
-        "socks5" | "socks5h" | "http" | "https" => {}
-        scheme => {
-            return Err(AtrError::InvalidArgument(format!(
-                "unsupported proxy scheme: {scheme}"
-            )));
+    match restore_tun_network_state(&tun_network_snapshot_path(runtime)) {
+        Ok(()) => {}
+        Err(AtrError::NotFound(err)) => {
+            helper_log!("[NulConnect][Helper][Tun] network snapshot already absent: {err}");
+        }
+        Err(err) => {
+            helper_log!("[NulConnect][Helper][Tun] restore network snapshot failed: {err}");
+            reset_dns_to_default();
         }
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| AtrError::InvalidArgument("proxy url must include host".into()))?;
-    if host != "127.0.0.1" && host != "::1" && host != "localhost" {
-        return Err(AtrError::InvalidArgument(
-            "helper only accepts loopback proxy endpoints".into(),
-        ));
-    }
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| AtrError::InvalidArgument("proxy url must include port".into()))?;
-    if port == 0 {
-        return Err(AtrError::InvalidArgument(
-            "proxy port must be non-zero".into(),
-        ));
-    }
-    Ok(())
+    flush_dns_cache();
 }
 
 fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) -> AtrResult<()> {
@@ -425,18 +545,15 @@ fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) ->
     let snapshot_path = legacy_tun_network_snapshot_path(state_path);
     snapshot_tun_network_state(&snapshot_path)?;
     log_tun_network_state("legacy before start");
-    eprintln!(
-        "[NulConnect][Helper][Tun] legacy start: proxy={} dns={} strategy={} virtual_pool={} setup_routes={} bypass={} managed_routes={} managed_domains={}",
-        config.proxy_url,
+    helper_log!(
+        "[NulConnect][Helper][Tun] legacy start: server={} dns={} setup_routes={} managed_routes={} managed_domains={}",
+        config.client.server_host,
         config.dns_addr,
-        config.dns_strategy,
-        config.virtual_dns_pool,
         config.setup_routes,
-        config.bypass_cidrs.len(),
         config.managed_route_cidrs.len(),
         config.managed_domains.len()
     );
-    let engine = match TunProxyEngine::start(config.clone().into_tun_proxy_config()?) {
+    let engine = match VpnEngine::start(config.clone().into_vpn_engine_config()?) {
         Ok(engine) => engine,
         Err(err) => {
             let _ = restore_tun_network_state(&snapshot_path);
@@ -450,7 +567,7 @@ fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) ->
         cleanup_scoped_dns_resolvers();
         remove_global_dns_state();
         if let Err(restore_err) = restore_tun_network_state(&snapshot_path) {
-            eprintln!(
+            helper_log!(
                 "[NulConnect][Helper][Tun] legacy restore network snapshot failed: {restore_err}"
             );
             reset_dns_to_default();
@@ -464,7 +581,7 @@ fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) ->
         cleanup_scoped_dns_resolvers();
         remove_global_dns_state();
         if let Err(restore_err) = restore_tun_network_state(&snapshot_path) {
-            eprintln!(
+            helper_log!(
                 "[NulConnect][Helper][Tun] legacy restore network snapshot failed: {restore_err}"
             );
             reset_dns_to_default();
@@ -500,7 +617,7 @@ fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) ->
     cleanup_scoped_dns_resolvers();
     remove_global_dns_state();
     if let Err(err) = restore_tun_network_state(&snapshot_path) {
-        eprintln!("[NulConnect][Helper][Tun] legacy restore network snapshot failed: {err}");
+        helper_log!("[NulConnect][Helper][Tun] legacy restore network snapshot failed: {err}");
         reset_dns_to_default();
     }
     flush_dns_cache();
@@ -517,7 +634,7 @@ fn raise_file_descriptor_limit() {
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
-            eprintln!(
+            helper_log!(
                 "[NulConnect][Helper] getrlimit(RLIMIT_NOFILE) failed: {}",
                 std::io::Error::last_os_error()
             );
@@ -530,12 +647,12 @@ fn raise_file_descriptor_limit() {
         }
         limit.rlim_cur = target;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-            eprintln!(
+            helper_log!(
                 "[NulConnect][Helper] setrlimit(RLIMIT_NOFILE={target}) failed: {}",
                 std::io::Error::last_os_error()
             );
         } else {
-            eprintln!("[NulConnect][Helper] RLIMIT_NOFILE raised to {target}");
+            helper_log!("[NulConnect][Helper] RLIMIT_NOFILE raised to {target}");
         }
     }
 }
@@ -585,6 +702,12 @@ fn write_tun_state(
     let data =
         serde_json::to_vec_pretty(&state).map_err(|err| AtrError::Internal(err.to_string()))?;
     fs::write(tun_state_path(runtime), data)?;
+    helper_log!(
+        "[NulConnect][Helper][Tun] state: status={} message={} sessions={}",
+        status,
+        message.unwrap_or(""),
+        sessions.map(|value| value.to_string()).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -605,7 +728,7 @@ fn legacy_tun_network_snapshot_path(state_path: &Path) -> PathBuf {
 
 fn snapshot_tun_network_state(path: &Path) -> AtrResult<()> {
     if path.exists() {
-        eprintln!(
+        helper_log!(
             "[NulConnect][Helper][Tun] network snapshot already exists: {}",
             path.display()
         );
@@ -632,7 +755,7 @@ fn snapshot_tun_network_state(path: &Path) -> AtrResult<()> {
     };
     let data = serde_json::to_vec_pretty(&snapshot)?;
     fs::write(path, data)?;
-    eprintln!(
+    helper_log!(
         "[NulConnect][Helper][Tun] saved network snapshot: {} services={}",
         path.display(),
         snapshot.services.len()
@@ -673,7 +796,7 @@ fn restore_tun_network_state(path: &Path) -> AtrResult<()> {
         run_networksetup(&search_args)?;
     }
     fs::remove_file(path)?;
-    eprintln!(
+    helper_log!(
         "[NulConnect][Helper][Tun] restored network snapshot: services={}",
         snapshot.services.len()
     );
@@ -681,7 +804,7 @@ fn restore_tun_network_state(path: &Path) -> AtrResult<()> {
 }
 
 fn reset_dns_to_default() {
-    eprintln!("[NulConnect][Helper][Tun] fallback reset DNS/search domains to Empty");
+    helper_log!("[NulConnect][Helper][Tun] fallback reset DNS/search domains to Empty");
     let Ok(services) = list_network_services() else {
         return;
     };
@@ -692,7 +815,7 @@ fn reset_dns_to_default() {
 }
 
 fn cleanup_tun_routes() {
-    eprintln!("[NulConnect][Helper][Tun] cleanup managed/fake-ip routes");
+    helper_log!("[NulConnect][Helper][Tun] cleanup managed/fake-ip routes");
     let _ = Command::new("/sbin/route")
         .args(["-n", "delete", "-net", "198.18.0.0/15"])
         .output();
@@ -715,18 +838,26 @@ fn cleanup_tun_routes() {
 
 fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
     if !config.setup_routes {
-        eprintln!("[NulConnect][Helper][Tun] managed route setup skipped");
+        helper_log!("[NulConnect][Helper][Tun] managed route setup skipped");
         return Ok(());
     }
 
     let tun_name = discover_tun_name()?;
-    configure_tun_interface(&tun_name)?;
-    configure_scoped_dns_resolvers(&config.managed_domains, "10.0.0.1")?;
+    configure_scoped_dns_resolvers(&config.managed_domains, &config.dns_addr)?;
 
-    let mut routes = vec![config.virtual_dns_pool.clone()];
+    let mut routes = config.managed_route_cidrs.clone();
+    if !config.dns_addr.trim().is_empty() {
+        routes.push(format!("{}/32", config.dns_addr.trim()));
+    }
     routes.extend(config.managed_route_cidrs.iter().cloned());
     routes.sort();
     routes.dedup();
+    let node_routes = node_route_cidrs(config)?;
+    let default_gateway = if node_routes.is_empty() {
+        None
+    } else {
+        Some(default_ipv4_gateway()?)
+    };
 
     let mut installed: Vec<String> = Vec::new();
     for cidr in routes {
@@ -741,90 +872,95 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
         }
         installed.push(cidr);
     }
-    let bypass_installed = add_bypass_host_routes(&config.bypass_cidrs)?;
-    installed.extend(bypass_installed);
+    if let Some(gateway) = default_gateway {
+        for cidr in node_routes {
+            if let Err(err) = add_route_cidr(&cidr, &gateway) {
+                helper_log!(
+                    "[NulConnect][Helper][Tun] warning: failed to add direct node route {} via {}: {}",
+                    cidr,
+                    gateway,
+                    err
+                );
+                continue;
+            }
+            installed.push(cidr);
+        }
+    }
     let data = serde_json::to_vec_pretty(&installed)?;
     fs::write(managed_routes_state_path(), data)?;
     flush_dns_cache();
-    eprintln!(
-        "[NulConnect][Helper][Tun] managed route setup ready: tun={} scoped_dns=10.0.0.1 routes={} domains={}",
+    helper_log!(
+        "[NulConnect][Helper][Tun] managed route setup ready: tun={} scoped_dns={} routes={} domains={}",
         tun_name,
+        config.dns_addr,
         installed.len(),
         config.managed_domains.len()
     );
     Ok(())
 }
 
-fn add_bypass_host_routes(bypass_cidrs: &[String]) -> AtrResult<Vec<String>> {
-    let Some(default_route) = default_route()? else {
-        eprintln!("[NulConnect][Helper][Tun] bypass host routes skipped: no default route");
-        return Ok(Vec::new());
-    };
-    if default_route.gateway == "10.0.0.1" || default_route.interface.starts_with("utun") {
-        eprintln!(
-            "[NulConnect][Helper][Tun] bypass host routes skipped: default via {} {}",
-            default_route.gateway, default_route.interface
-        );
-        return Ok(Vec::new());
-    }
-
-    let mut installed = Vec::new();
-    for cidr in bypass_cidrs {
-        let Some(host) = host_from_cidr32(cidr) else {
+fn node_route_cidrs(config: &HelperConfig) -> AtrResult<Vec<String>> {
+    let resource_bytes = base64::engine::general_purpose::STANDARD
+        .decode(config.resource_bytes.as_bytes())
+        .map_err(|err| AtrError::InvalidArgument(format!("invalid resource bytes: {err}")))?;
+    let resource = parse_resource_bytes(&resource_bytes, &config.service_host)
+        .map_err(|err| AtrError::ParseFailed(err.to_string()))?;
+    let mut routes = Vec::new();
+    for endpoint in resource.node_groups.values().flatten() {
+        let Some(host) = endpoint_host(endpoint) else {
             continue;
         };
-        eprintln!(
-            "[NulConnect][Helper][Tun] route add bypass -host {} {}",
-            host, default_route.gateway
-        );
-        match add_route_host(&host, &default_route.gateway) {
-            Ok(()) => installed.push(format!("{host}/32")),
-            Err(err) => {
-                for route in installed {
-                    delete_route_cidr(&route);
-                }
-                return Err(err);
+        for ip in resolve_endpoint_ipv4s(host) {
+            routes.push(format!("{ip}/32"));
+        }
+    }
+    routes.sort();
+    routes.dedup();
+    helper_log!(
+        "[NulConnect][Helper][Tun] direct node routes: {}",
+        routes.join(",")
+    );
+    Ok(routes)
+}
+
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let endpoint = endpoint.trim();
+    let (host, _port) = endpoint.rsplit_once(':')?;
+    let host = host.trim().trim_matches(['[', ']']);
+    if host.is_empty() { None } else { Some(host) }
+}
+
+fn resolve_endpoint_ipv4s(host: &str) -> Vec<Ipv4Addr> {
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return vec![ip];
+    }
+    (host, 0)
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .filter_map(|addr| match addr.ip() {
+                    std::net::IpAddr::V4(ip) => Some(ip),
+                    std::net::IpAddr::V6(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn default_ipv4_gateway() -> AtrResult<String> {
+    let text = command_text("/sbin/route", &["-n", "get", "default"])?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(gateway) = trimmed.strip_prefix("gateway:") {
+            let gateway = gateway.trim();
+            if gateway.parse::<Ipv4Addr>().is_ok() {
+                return Ok(gateway.to_string());
             }
         }
     }
-    Ok(installed)
-}
-
-#[derive(Debug)]
-struct DefaultRoute {
-    gateway: String,
-    interface: String,
-}
-
-fn default_route() -> AtrResult<Option<DefaultRoute>> {
-    let text = command_text("/sbin/route", &["-n", "get", "default"])?;
-    let gateway = route_field(&text, "gateway");
-    let interface = route_field(&text, "interface");
-    Ok(match (gateway, interface) {
-        (Some(gateway), Some(interface)) => Some(DefaultRoute { gateway, interface }),
-        _ => None,
-    })
-}
-
-fn route_field(text: &str, name: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        if key.trim() == name {
-            Some(value.trim().to_string())
-        } else {
-            None
-        }
-    })
-}
-
-fn host_from_cidr32(cidr: &str) -> Option<String> {
-    let trimmed = cidr.trim();
-    let (host, prefix) = trimmed.split_once('/')?;
-    if prefix == "32" && host.parse::<std::net::Ipv4Addr>().is_ok() {
-        Some(host.to_string())
-    } else {
-        None
-    }
+    Err(AtrError::NetworkFailed(
+        "unable to discover default IPv4 gateway".to_string(),
+    ))
 }
 
 fn discover_tun_name() -> AtrResult<String> {
@@ -841,7 +977,7 @@ fn discover_tun_name() -> AtrResult<String> {
     for block in text.split('\n').collect::<Vec<_>>().windows(2) {
         let header = block[0];
         let body = block[1];
-        if !header.starts_with("utun") || !body.contains("10.0.0.33") {
+        if !header.starts_with("utun") || !body.contains("inet ") {
             continue;
         }
         if let Some((name, _)) = header.split_once(':') {
@@ -853,19 +989,6 @@ fn discover_tun_name() -> AtrResult<String> {
     ))
 }
 
-fn configure_tun_interface(tun_name: &str) -> AtrResult<()> {
-    run_command_ok(
-        "/sbin/ifconfig",
-        &[
-            tun_name,
-            "10.0.0.33",
-            "10.0.0.1",
-            "netmask",
-            "255.255.255.0",
-        ],
-    )
-}
-
 fn configure_scoped_dns_resolvers(domains: &[String], server: &str) -> AtrResult<()> {
     cleanup_scoped_dns_resolvers();
     let resolver_dir = Path::new("/etc/resolver");
@@ -874,7 +997,7 @@ fn configure_scoped_dns_resolvers(domains: &[String], server: &str) -> AtrResult
     let mut installed = Vec::new();
     for domain in normalized_resolver_domains(domains) {
         let path = resolver_dir.join(&domain);
-        eprintln!(
+        helper_log!(
             "[NulConnect][Helper][Tun] set scoped DNS resolver {} -> {}",
             path.display(),
             server
@@ -900,7 +1023,7 @@ fn cleanup_scoped_dns_resolvers() {
                     continue;
                 }
                 let path = Path::new("/etc/resolver").join(domain);
-                eprintln!(
+                helper_log!(
                     "[NulConnect][Helper][Tun] remove scoped DNS resolver {}",
                     path.display()
                 );
@@ -941,7 +1064,7 @@ fn normalized_resolver_domains(domains: &[String]) -> Vec<String> {
 
 fn add_route_cidr(cidr: &str, gateway: &str) -> AtrResult<()> {
     let normalized = normalize_route_cidr(cidr)?;
-    eprintln!(
+    helper_log!(
         "[NulConnect][Helper][Tun] route add {} {}",
         normalized.route_args.join(" "),
         gateway
@@ -952,18 +1075,6 @@ fn add_route_cidr(cidr: &str, gateway: &str) -> AtrResult<()> {
     match run_command_ok("/sbin/route", &args) {
         Ok(()) => Ok(()),
         Err(err) if err.to_string().contains("File exists") => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-fn add_route_host(host: &str, gateway: &str) -> AtrResult<()> {
-    let args = ["-n", "add", "-host", host, gateway];
-    match run_command_ok("/sbin/route", &args) {
-        Ok(()) => Ok(()),
-        Err(err) if err.to_string().contains("File exists") => {
-            let args = ["-n", "change", "-host", host, gateway];
-            run_command_ok("/sbin/route", &args)
-        }
         Err(err) => Err(err),
     }
 }
@@ -1020,15 +1131,14 @@ fn wait_for_tun_setup(config: &HelperConfig) -> AtrResult<()> {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        let route_ready = tun_route_ready_for_cidr(&config.virtual_dns_pool)
-            && config
-                .managed_route_cidrs
-                .iter()
-                .all(|cidr| tun_route_ready_for_cidr(cidr));
-        let dns_ready = scoped_dns_ready(&config.managed_domains);
+        let route_ready = config
+            .managed_route_cidrs
+            .iter()
+            .all(|cidr| tun_route_ready_for_cidr(cidr));
+        let dns_ready = scoped_dns_ready(&config.managed_domains, &config.dns_addr);
 
         if route_ready && dns_ready {
-            eprintln!("[NulConnect][Helper][Tun] setup ready: route=true dns=true");
+            helper_log!("[NulConnect][Helper][Tun] setup ready: route=true dns=true");
             return Ok(());
         }
 
@@ -1050,18 +1160,16 @@ fn tun_route_ready_for_cidr(cidr: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn scoped_dns_ready(domains: &[String]) -> bool {
+fn scoped_dns_ready(domains: &[String], server: &str) -> bool {
     let domains = normalized_resolver_domains(domains);
     if domains.is_empty() {
         return true;
     }
+    let expected = format!("nameserver {}", server.trim());
     domains.iter().all(|domain| {
         let path = Path::new("/etc/resolver").join(domain);
         fs::read_to_string(path)
-            .map(|text| {
-                text.lines()
-                    .any(|line| line.trim() == "nameserver 10.0.0.1")
-            })
+            .map(|text| text.lines().any(|line| line.trim() == expected))
             .unwrap_or(false)
     })
 }
@@ -1131,14 +1239,14 @@ fn command_text(program: &str, args: &[&str]) -> AtrResult<String> {
 }
 
 fn remove_global_dns_state() {
-    eprintln!("[NulConnect][Helper][Tun] remove State:/Network/Global/DNS");
+    helper_log!("[NulConnect][Helper][Tun] remove State:/Network/Global/DNS");
     let Ok(mut child) = Command::new("/usr/sbin/scutil")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
     else {
-        eprintln!("[NulConnect][Helper][Tun] failed to spawn scutil");
+        helper_log!("[NulConnect][Helper][Tun] failed to spawn scutil");
         return;
     };
     if let Some(stdin) = child.stdin.as_mut() {
@@ -1148,16 +1256,16 @@ fn remove_global_dns_state() {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            eprintln!("[NulConnect][Helper][Tun] scutil remove Global/DNS failed: {stderr}");
+            helper_log!("[NulConnect][Helper][Tun] scutil remove Global/DNS failed: {stderr}");
         }
         Err(err) => {
-            eprintln!("[NulConnect][Helper][Tun] scutil remove Global/DNS wait failed: {err}");
+            helper_log!("[NulConnect][Helper][Tun] scutil remove Global/DNS wait failed: {err}");
         }
     }
 }
 
 fn flush_dns_cache() {
-    eprintln!("[NulConnect][Helper][Tun] flush DNS caches");
+    helper_log!("[NulConnect][Helper][Tun] flush DNS caches");
     let _ = Command::new("/usr/bin/dscacheutil")
         .arg("-flushcache")
         .output();
@@ -1167,7 +1275,7 @@ fn flush_dns_cache() {
 }
 
 fn log_tun_network_state(label: &str) {
-    eprintln!("[NulConnect][Helper][Tun][Diag] {label}");
+    helper_log!("[NulConnect][Helper][Tun][Diag] {label}");
     log_command_output(
         "global_dns",
         Command::new("/usr/sbin/scutil")
@@ -1180,6 +1288,30 @@ fn log_tun_network_state(label: &str) {
         "route_198",
         Command::new("/usr/sbin/netstat")
             .args(["-rn", "-f", "inet"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        None,
+    );
+    log_command_output(
+        "ifconfig_utun",
+        Command::new("/sbin/ifconfig")
+            .args(["-a"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        None,
+    );
+    log_command_output(
+        "route_get_tibaiot",
+        Command::new("/sbin/route")
+            .args(["-n", "get", "10.160.22.90"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        None,
+    );
+    log_command_output(
+        "route_get_hpc",
+        Command::new("/sbin/route")
+            .args(["-n", "get", "10.70.2.174"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
         None,
@@ -1204,7 +1336,7 @@ fn log_command_output(label: &str, command: &mut Command, stdin_data: Option<&[u
                 child.wait_with_output()
             }
             Err(err) => {
-                eprintln!("[NulConnect][Helper][Tun][Diag] {label}: spawn failed: {err}");
+                helper_log!("[NulConnect][Helper][Tun][Diag] {label}: spawn failed: {err}");
                 return;
             }
         }
@@ -1222,10 +1354,10 @@ fn log_command_output(label: &str, command: &mut Command, stdin_data: Option<&[u
                 stdout.trim()
             };
             let first_lines = text.lines().take(24).collect::<Vec<_>>().join(" | ");
-            eprintln!("[NulConnect][Helper][Tun][Diag] {label}: {first_lines}");
+            helper_log!("[NulConnect][Helper][Tun][Diag] {label}: {first_lines}");
         }
         Err(err) => {
-            eprintln!("[NulConnect][Helper][Tun][Diag] {label}: failed: {err}");
+            helper_log!("[NulConnect][Helper][Tun][Diag] {label}: failed: {err}");
         }
     }
 }
@@ -1246,51 +1378,58 @@ fn read_networksetup_list(args: &[&str]) -> AtrResult<Vec<String>> {
 }
 
 impl HelperConfig {
-    fn into_tun_proxy_config(self) -> AtrResult<TunProxyConfig> {
-        Ok(TunProxyConfig {
-            proxy_url: self.proxy_url,
+    fn into_vpn_engine_config(self) -> AtrResult<VpnEngineConfig> {
+        let resource_bytes = base64::engine::general_purpose::STANDARD
+            .decode(self.resource_bytes.as_bytes())
+            .map_err(|err| AtrError::ParseFailed(format!("invalid resource_bytes: {err}")))?;
+        Ok(VpnEngineConfig {
+            client: self.client.into(),
+            session: self.session.into(),
+            resource_bytes,
+            service_host: self.service_host,
             tun_name: self.tun_name.filter(|value| !value.is_empty()),
-            dns_strategy: parse_dns_strategy(&self.dns_strategy)?,
-            dns_addr: self.dns_addr,
-            virtual_dns_pool: self.virtual_dns_pool,
-            bypass_cidrs: self.bypass_cidrs,
             mtu: self.mtu,
-            tcp_timeout_secs: self.tcp_timeout_secs,
-            udp_timeout_secs: self.udp_timeout_secs,
-            max_sessions: self.max_sessions,
-            // Route/DNS setup is performed by the helper so tun2proxy never
-            // installs a system default route that can recurse into localhost.
-            setup_routes: false,
-            ipv6_enabled: self.ipv6_enabled,
-            packet_information: self.packet_information,
+            packet_information: false,
             exit_on_fatal_error: self.exit_on_fatal_error,
-            verbosity: parse_log_level(&self.verbosity)?,
         })
     }
 }
 
-fn parse_dns_strategy(value: &str) -> AtrResult<TunDnsStrategy> {
-    match value {
-        "virtual" => Ok(TunDnsStrategy::Virtual),
-        "over-tcp" => Ok(TunDnsStrategy::OverTcp),
-        "direct" => Ok(TunDnsStrategy::Direct),
-        _ => Err(AtrError::InvalidArgument(format!(
-            "invalid dns strategy: {value}"
-        ))),
+impl From<HelperClientConfig> for ClientConfig {
+    fn from(value: HelperClientConfig) -> Self {
+        Self {
+            server_host: value.server_host,
+            server_port: value.server_port,
+            user_agent: value.user_agent,
+            connect_timeout_ms: value.connect_timeout_ms,
+            io_timeout_ms: value.io_timeout_ms,
+            node_probe_timeout_ms: value.node_probe_timeout_ms,
+            allow_insecure_tls: value.allow_insecure_tls,
+        }
     }
 }
 
-fn parse_log_level(value: &str) -> AtrResult<TunLogLevel> {
-    match value {
-        "off" => Ok(TunLogLevel::Off),
-        "error" => Ok(TunLogLevel::Error),
-        "warn" => Ok(TunLogLevel::Warn),
-        "info" => Ok(TunLogLevel::Info),
-        "debug" => Ok(TunLogLevel::Debug),
-        "trace" => Ok(TunLogLevel::Trace),
-        _ => Err(AtrError::InvalidArgument(format!(
-            "invalid log level: {value}"
-        ))),
+impl From<HelperSessionMaterial> for VpnSessionMaterial {
+    fn from(value: HelperSessionMaterial) -> Self {
+        Self {
+            username: value.username,
+            sid: value.sid,
+            device_id: value.device_id,
+            connection_id: value.connection_id,
+            sign_key_hex: value.sign_key_hex,
+            cookies: value.cookies.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<HelperCookieRecord> for VpnCookieRecord {
+    fn from(value: HelperCookieRecord) -> Self {
+        Self {
+            host: value.host,
+            scheme: value.scheme,
+            name: value.name,
+            value: value.value,
+        }
     }
 }
 

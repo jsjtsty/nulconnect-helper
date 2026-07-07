@@ -1,5 +1,7 @@
 mod error;
-mod tun_proxy;
+mod vpn_engine;
 
 pub use error::{AtrError, AtrResult, ErrorCode};
-pub use tun_proxy::{TunDnsStrategy, TunLogLevel, TunProxyConfig, TunProxyEngine, TunProxyStatus};
+pub use vpn_engine::{
+    VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnEngineStatus, VpnSessionMaterial,
+};
