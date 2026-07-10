@@ -1,5 +1,5 @@
 use base64::Engine as _;
-use nulconnect_tun::{
+use nulconnect_helper::{
     AtrError, AtrResult, VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnSessionMaterial,
 };
 use reatrust::{ClientConfig, parse_resource_bytes};
@@ -133,6 +133,7 @@ struct HelperErrorResponse {
 struct HelperRuntime {
     state_dir: PathBuf,
     tun_engine: Mutex<Option<VpnEngine>>,
+    tun_operation: Mutex<()>,
     tun_starting: Mutex<bool>,
     tun_failure: Mutex<Option<String>>,
     shutting_down: Mutex<bool>,
@@ -233,6 +234,7 @@ fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
     let runtime = Arc::new(HelperRuntime {
         state_dir: state_dir.to_path_buf(),
         tun_engine: Mutex::new(None),
+        tun_operation: Mutex::new(()),
         tun_starting: Mutex::new(false),
         tun_failure: Mutex::new(None),
         shutting_down: Mutex::new(false),
@@ -460,6 +462,7 @@ fn start_tun(runtime: Arc<HelperRuntime>, config: HelperConfig) -> AtrResult<Val
 }
 
 fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<()> {
+    let _operation = runtime.tun_operation.lock().unwrap();
     if runtime.tun_engine.lock().unwrap().is_some() {
         return Err(AtrError::InvalidState("tun is already running".into()));
     }
@@ -488,15 +491,15 @@ fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<
     helper_log!("[NulConnect][Helper][Tun] worker: L3 engine created");
     if let Err(err) = setup_managed_tun_routes(&config) {
         helper_log!("[NulConnect][Helper][Tun] worker: route setup failed: {err}");
-        restore_tun_network_after_stop(runtime);
         let _ = engine.stop();
+        restore_tun_network_after_stop(runtime);
         return Err(err);
     }
     helper_log!("[NulConnect][Helper][Tun] worker: route setup complete");
     if let Err(err) = wait_for_tun_setup(&config) {
         helper_log!("[NulConnect][Helper][Tun] worker: setup wait failed: {err}");
-        restore_tun_network_after_stop(runtime);
         let _ = engine.stop();
+        restore_tun_network_after_stop(runtime);
         return Err(err);
     }
     helper_log!("[NulConnect][Helper][Tun] worker: setup wait complete");
@@ -508,16 +511,17 @@ fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<
 
 fn stop_tun(runtime: &HelperRuntime) -> AtrResult<()> {
     helper_log!("[NulConnect][Helper][Tun] stop: requested");
+    let _operation = runtime.tun_operation.lock().unwrap();
     log_tun_network_state("before stop");
     *runtime.tun_failure.lock().unwrap() = None;
     let mut guard = runtime.tun_engine.lock().unwrap();
-    if let Some(engine) = guard.take() {
-        engine.cancel();
-    }
+    let engine = guard.take();
     drop(guard);
+    let stop_result = engine.map(|engine| engine.stop()).transpose();
     restore_tun_network_after_stop(runtime);
     log_tun_network_state("after stop");
     write_tun_state(runtime, "stopped", None, None)?;
+    stop_result?;
     Ok(())
 }
 
@@ -604,6 +608,17 @@ fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) ->
                 }
                 Err(err) => {
                     let message = err.to_string();
+                    let _ = engine.stop();
+                    cleanup_tun_routes();
+                    cleanup_scoped_dns_resolvers();
+                    remove_global_dns_state();
+                    if let Err(restore_err) = restore_tun_network_state(&snapshot_path) {
+                        helper_log!(
+                            "[NulConnect][Helper][Tun] legacy failure restore failed: {restore_err}"
+                        );
+                        reset_dns_to_default();
+                    }
+                    flush_dns_cache();
                     write_legacy_state(state_path, "failed", Some(&message), None)?;
                     return Err(err);
                 }

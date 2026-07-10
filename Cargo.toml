@@ -1,5 +1,5 @@
 [package]
-name = "nulconnect-tun"
+name = "nulconnect-helper"
 version = "0.1.12"
 edition = "2024"
 
@@ -8,7 +8,7 @@ crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "nulconnect-helper"
-path = "src/bin/nulconnect_tun_helper.rs"
+path = "src/bin/nulconnect_helper.rs"
 
 [profile.release]
 lto = "thin"

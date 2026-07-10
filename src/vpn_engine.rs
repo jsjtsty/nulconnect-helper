@@ -116,7 +116,7 @@ impl VpnEngine {
 
 impl Drop for VpnEngine {
     fn drop(&mut self) {
-        self.cancel();
+        let _ = self.stop();
     }
 }
 

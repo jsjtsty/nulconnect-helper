@@ -790,7 +790,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nulconnect-tun"
+name = "nulconnect-helper"
 version = "0.1.12"
 dependencies = [
  "base64",
