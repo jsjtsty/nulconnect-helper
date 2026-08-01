@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use nulconnect_helper::{
-    AtrError, AtrResult, VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnSessionMaterial,
+    AtrError, AtrResult, VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnEngineStatus,
+    VpnSessionMaterial,
 };
 use reatrust::{ClientConfig, parse_resource_bytes};
 use serde::{Deserialize, Serialize};
@@ -383,21 +384,10 @@ fn helper_status(runtime: &HelperRuntime) -> AtrResult<Value> {
         } else if let Some(message) = runtime.tun_failure.lock().unwrap().clone() {
             json!({ "status": "failed", "message": message })
         } else {
-            let mut guard = runtime.tun_engine.lock().unwrap();
+            let guard = runtime.tun_engine.lock().unwrap();
             if let Some(engine) = guard.as_ref() {
-                if let Some(result) = engine.take_result() {
-                    *guard = None;
-                    match result {
-                        Ok(sessions) => {
-                            write_tun_state(runtime, "stopped", None, Some(sessions))?;
-                            json!({ "status": "stopped", "sessions": sessions })
-                        }
-                        Err(err) => {
-                            let message = err.to_string();
-                            write_tun_state(runtime, "failed", Some(&message), None)?;
-                            json!({ "status": "failed", "message": message })
-                        }
-                    }
+                if engine.status() == VpnEngineStatus::Stopped {
+                    json!({ "status": "stopping" })
                 } else {
                     json!({ "status": "running" })
                 }
@@ -447,6 +437,15 @@ fn start_tun(runtime: Arc<HelperRuntime>, config: HelperConfig) -> AtrResult<Val
             match result {
                 Ok(()) => {
                     helper_log!("[NulConnect][Helper][Tun] start worker: running");
+                    if let Err(err) = spawn_tun_runtime_monitor(runtime.clone()) {
+                        let message = err.to_string();
+                        helper_log!(
+                            "[NulConnect][Helper][Tun] failed to start runtime monitor: {message}"
+                        );
+                        *runtime.tun_failure.lock().unwrap() = Some(message.clone());
+                        let _ = stop_tun(&runtime);
+                        let _ = write_tun_state(&runtime, "failed", Some(&message), None);
+                    }
                 }
                 Err(err) => {
                     let message = err.to_string();
@@ -507,6 +506,54 @@ fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<
     log_tun_network_state("after start");
     write_tun_state(runtime, "running", None, None)?;
     Ok(())
+}
+
+fn spawn_tun_runtime_monitor(runtime: Arc<HelperRuntime>) -> AtrResult<()> {
+    thread::Builder::new()
+        .name("nulconnect-tun-monitor".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let stopped = {
+                    let guard = runtime.tun_engine.lock().unwrap();
+                    match guard.as_ref() {
+                        Some(engine) => engine.status() == VpnEngineStatus::Stopped,
+                        None => return,
+                    }
+                };
+                if !stopped {
+                    continue;
+                }
+
+                let _operation = runtime.tun_operation.lock().unwrap();
+                let engine = runtime.tun_engine.lock().unwrap().take();
+                let Some(engine) = engine else {
+                    return;
+                };
+                let result = engine.take_result();
+                let _ = engine.stop();
+                restore_tun_network_after_stop(&runtime);
+
+                match result {
+                    Some(Ok(sessions)) => {
+                        *runtime.tun_failure.lock().unwrap() = None;
+                        let _ = write_tun_state(&runtime, "stopped", None, Some(sessions));
+                    }
+                    Some(Err(err)) => {
+                        let message = err.to_string();
+                        helper_log!("[NulConnect][Helper][Tun] runtime failed: {message}");
+                        *runtime.tun_failure.lock().unwrap() = Some(message.clone());
+                        let _ = write_tun_state(&runtime, "failed", Some(&message), None);
+                    }
+                    None => {
+                        let _ = write_tun_state(&runtime, "stopped", None, None);
+                    }
+                }
+                return;
+            }
+        })
+        .map(|_| ())
+        .map_err(|err| AtrError::Internal(format!("failed to start TUN monitor: {err}")))
 }
 
 fn stop_tun(runtime: &HelperRuntime) -> AtrResult<()> {
@@ -1420,6 +1467,8 @@ impl From<HelperClientConfig> for ClientConfig {
             io_timeout_ms: value.io_timeout_ms,
             node_probe_timeout_ms: value.node_probe_timeout_ms,
             allow_insecure_tls: value.allow_insecure_tls,
+            bind_interface: None,
+            auto_detect_interface: true,
         }
     }
 }

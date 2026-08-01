@@ -622,6 +622,7 @@ dependencies = [
  "ipnet",
  "libc",
  "md5",
+ "mio",
  "rand 0.8.6",
  "reqwest",
  "rsa",
@@ -629,8 +630,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "thiserror",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -694,6 +697,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -791,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "nulconnect-helper"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "base64",
  "libc",
