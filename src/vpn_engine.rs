@@ -510,7 +510,7 @@ fn packet_information_header(packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
         } else {
             libc::AF_INET
         };
-        return (family as u32).to_be_bytes();
+        (family as u32).to_be_bytes()
     }
 
     #[cfg(not(any(

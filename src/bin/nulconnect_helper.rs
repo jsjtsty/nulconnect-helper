@@ -7,10 +7,13 @@ use reatrust::{ClientConfig, parse_resource_bytes};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
+use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -75,15 +78,6 @@ struct HelperCookieRecord {
     value: String,
 }
 
-#[derive(Debug, Serialize)]
-struct LegacyHelperState {
-    pid: u32,
-    status: String,
-    message: Option<String>,
-    updated_at_unix_secs: u64,
-    sessions: Option<usize>,
-}
-
 #[derive(Debug, Deserialize)]
 struct HelperRequest {
     id: String,
@@ -97,7 +91,7 @@ enum HelperCommand {
     Version,
     Status,
     StartTun {
-        config: HelperConfig,
+        config: Box<HelperConfig>,
     },
     StopTun,
     SetSystemProxy {
@@ -133,6 +127,7 @@ struct HelperErrorResponse {
 
 struct HelperRuntime {
     state_dir: PathBuf,
+    socket_path: PathBuf,
     tun_engine: Mutex<Option<VpnEngine>>,
     tun_operation: Mutex<()>,
     tun_starting: Mutex<bool>,
@@ -186,12 +181,6 @@ fn run() -> AtrResult<()> {
         .ok_or_else(|| AtrError::InvalidArgument("missing command".into()))?;
 
     match command.as_str() {
-        "run" => {
-            let config_path = required_path(args.next(), "config path")?;
-            let state_path = required_path(args.next(), "state path")?;
-            let stop_path = required_path(args.next(), "stop path")?;
-            run_legacy_engine(&config_path, &state_path, &stop_path)
-        }
         "serve" => {
             let socket_path = args
                 .next()
@@ -201,7 +190,9 @@ fn run() -> AtrResult<()> {
                 .next()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
-            serve(&socket_path, &state_dir)
+            let allowed_uid = required_id(args.next(), "allowed uid")?;
+            let allowed_gid = required_id(args.next(), "allowed gid")?;
+            serve(&socket_path, &state_dir, allowed_uid, allowed_gid)
         }
         "version" => {
             println!("{HELPER_VERSION}");
@@ -213,7 +204,12 @@ fn run() -> AtrResult<()> {
     }
 }
 
-fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
+fn serve(
+    socket_path: &Path,
+    state_dir: &Path,
+    allowed_uid: libc::uid_t,
+    allowed_gid: libc::gid_t,
+) -> AtrResult<()> {
     helper_log!(
         "[NulConnect][Helper] serve: socket={} state_dir={}",
         socket_path.display(),
@@ -228,12 +224,13 @@ fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
     }
 
     let listener = UnixListener::bind(socket_path)?;
-    listener.set_nonblocking(true)?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o777))?;
+    set_socket_owner(socket_path, allowed_uid, allowed_gid)?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))?;
     helper_log!("[NulConnect][Helper] serve: listening");
 
     let runtime = Arc::new(HelperRuntime {
         state_dir: state_dir.to_path_buf(),
+        socket_path: socket_path.to_path_buf(),
         tun_engine: Mutex::new(None),
         tun_operation: Mutex::new(()),
         tun_starting: Mutex::new(false),
@@ -242,28 +239,34 @@ fn serve(socket_path: &Path, state_dir: &Path) -> AtrResult<()> {
     });
 
     loop {
+        let (stream, _addr) = listener.accept()?;
         if *runtime.shutting_down.lock().unwrap() {
             break;
         }
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                helper_log!("[NulConnect][Helper] serve: accepted client");
-                if let Err(err) = stream.set_nonblocking(false) {
-                    helper_log!("[NulConnect][Helper] accepted client set blocking failed: {err}");
-                    continue;
-                }
-                let worker_runtime = runtime.clone();
-                thread::spawn(move || {
-                    if let Err(err) = handle_client(stream, worker_runtime) {
-                        helper_log!("[NulConnect][Helper] client handler failed: {err}");
-                    }
-                });
+
+        let (peer_uid, _peer_gid) = match peer_credentials(&stream) {
+            Ok(credentials) => credentials,
+            Err(err) => {
+                helper_log!(
+                    "[NulConnect][Helper] rejected client with unreadable credentials: {err}"
+                );
+                continue;
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(err) => return Err(AtrError::from(err)),
+        };
+        if peer_uid != allowed_uid && peer_uid != 0 {
+            helper_log!(
+                "[NulConnect][Helper] rejected client uid={peer_uid}, expected uid={allowed_uid}"
+            );
+            continue;
         }
+
+        helper_log!("[NulConnect][Helper] serve: accepted authorized client uid={peer_uid}");
+        let worker_runtime = runtime.clone();
+        thread::spawn(move || {
+            if let Err(err) = handle_client(stream, worker_runtime) {
+                helper_log!("[NulConnect][Helper] client handler failed: {err}");
+            }
+        });
     }
 
     let _ = stop_tun(&runtime);
@@ -338,7 +341,7 @@ fn handle_request(request: HelperRequest, runtime: &Arc<HelperRuntime>) -> Helpe
             "pid": std::process::id(),
         })),
         HelperCommand::Status => helper_status(runtime),
-        HelperCommand::StartTun { config } => start_tun(runtime.clone(), config),
+        HelperCommand::StartTun { config } => start_tun(runtime.clone(), *config),
         HelperCommand::StopTun => stop_tun(runtime).map(|_| json!({ "status": "stopped" })),
         HelperCommand::SetSystemProxy {
             endpoint,
@@ -354,6 +357,7 @@ fn handle_request(request: HelperRequest, runtime: &Arc<HelperRuntime>) -> Helpe
         HelperCommand::Shutdown => {
             let _ = stop_tun(runtime);
             *runtime.shutting_down.lock().unwrap() = true;
+            let _ = UnixStream::connect(&runtime.socket_path);
             Ok(json!({ "status": "shutting_down" }))
         }
     };
@@ -589,106 +593,6 @@ fn restore_tun_network_after_stop(runtime: &HelperRuntime) {
     flush_dns_cache();
 }
 
-fn run_legacy_engine(config_path: &Path, state_path: &Path, stop_path: &Path) -> AtrResult<()> {
-    let data = fs::read(config_path)?;
-    let config: HelperConfig =
-        serde_json::from_slice(&data).map_err(|err| AtrError::ParseFailed(err.to_string()))?;
-    let snapshot_path = legacy_tun_network_snapshot_path(state_path);
-    snapshot_tun_network_state(&snapshot_path)?;
-    log_tun_network_state("legacy before start");
-    helper_log!(
-        "[NulConnect][Helper][Tun] legacy start: server={} dns={} setup_routes={} managed_routes={} managed_domains={}",
-        config.client.server_host,
-        config.dns_addr,
-        config.setup_routes,
-        config.managed_route_cidrs.len(),
-        config.managed_domains.len()
-    );
-    let engine = match VpnEngine::start(config.clone().into_vpn_engine_config()?) {
-        Ok(engine) => engine,
-        Err(err) => {
-            let _ = restore_tun_network_state(&snapshot_path);
-            cleanup_tun_routes();
-            return Err(err);
-        }
-    };
-    if let Err(err) = setup_managed_tun_routes(&config) {
-        engine.cancel();
-        cleanup_tun_routes();
-        cleanup_scoped_dns_resolvers();
-        remove_global_dns_state();
-        if let Err(restore_err) = restore_tun_network_state(&snapshot_path) {
-            helper_log!(
-                "[NulConnect][Helper][Tun] legacy restore network snapshot failed: {restore_err}"
-            );
-            reset_dns_to_default();
-        }
-        flush_dns_cache();
-        return Err(err);
-    }
-    if let Err(err) = wait_for_tun_setup(&config) {
-        engine.cancel();
-        cleanup_tun_routes();
-        cleanup_scoped_dns_resolvers();
-        remove_global_dns_state();
-        if let Err(restore_err) = restore_tun_network_state(&snapshot_path) {
-            helper_log!(
-                "[NulConnect][Helper][Tun] legacy restore network snapshot failed: {restore_err}"
-            );
-            reset_dns_to_default();
-        }
-        flush_dns_cache();
-        return Err(err);
-    }
-    log_tun_network_state("legacy after start");
-    write_legacy_state(state_path, "running", None, None)?;
-
-    loop {
-        if stop_path.exists() {
-            break;
-        }
-        if let Some(result) = engine.take_result() {
-            match result {
-                Ok(sessions) => {
-                    write_legacy_state(state_path, "stopped", None, Some(sessions))?;
-                    return Ok(());
-                }
-                Err(err) => {
-                    let message = err.to_string();
-                    let _ = engine.stop();
-                    cleanup_tun_routes();
-                    cleanup_scoped_dns_resolvers();
-                    remove_global_dns_state();
-                    if let Err(restore_err) = restore_tun_network_state(&snapshot_path) {
-                        helper_log!(
-                            "[NulConnect][Helper][Tun] legacy failure restore failed: {restore_err}"
-                        );
-                        reset_dns_to_default();
-                    }
-                    flush_dns_cache();
-                    write_legacy_state(state_path, "failed", Some(&message), None)?;
-                    return Err(err);
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-
-    let stop_result = engine.stop();
-    cleanup_tun_routes();
-    cleanup_scoped_dns_resolvers();
-    remove_global_dns_state();
-    if let Err(err) = restore_tun_network_state(&snapshot_path) {
-        helper_log!("[NulConnect][Helper][Tun] legacy restore network snapshot failed: {err}");
-        reset_dns_to_default();
-    }
-    flush_dns_cache();
-    log_tun_network_state("legacy after stop");
-    stop_result?;
-    write_legacy_state(state_path, "stopped", None, None)?;
-    Ok(())
-}
-
 fn raise_file_descriptor_limit() {
     unsafe {
         let mut limit = libc::rlimit {
@@ -719,32 +623,33 @@ fn raise_file_descriptor_limit() {
     }
 }
 
-fn required_path(value: Option<String>, name: &str) -> AtrResult<PathBuf> {
+fn required_id(value: Option<String>, name: &str) -> AtrResult<u32> {
     value
-        .map(PathBuf::from)
-        .ok_or_else(|| AtrError::InvalidArgument(format!("missing {name}")))
+        .ok_or_else(|| AtrError::InvalidArgument(format!("missing {name}")))?
+        .parse::<u32>()
+        .map_err(|_| AtrError::InvalidArgument(format!("invalid {name}")))
 }
 
-fn write_legacy_state(
-    path: &Path,
-    status: &str,
-    message: Option<&str>,
-    sessions: Option<usize>,
-) -> AtrResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn set_socket_owner(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> AtrResult<()> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| AtrError::InvalidArgument("socket path contains a null byte".into()))?;
+    let result = unsafe { libc::chown(path.as_ptr(), uid, gid) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(AtrError::from(std::io::Error::last_os_error()))
     }
-    let state = LegacyHelperState {
-        pid: std::process::id(),
-        status: status.to_string(),
-        message: message.map(ToString::to_string),
-        updated_at_unix_secs: now_unix_secs(),
-        sessions,
-    };
-    let data =
-        serde_json::to_vec_pretty(&state).map_err(|err| AtrError::Internal(err.to_string()))?;
-    fs::write(path, data)?;
-    Ok(())
+}
+
+fn peer_credentials(stream: &UnixStream) -> AtrResult<(libc::uid_t, libc::gid_t)> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if result == 0 {
+        Ok((uid, gid))
+    } else {
+        Err(AtrError::from(std::io::Error::last_os_error()))
+    }
 }
 
 fn write_tun_state(
@@ -779,13 +684,6 @@ fn tun_state_path(runtime: &HelperRuntime) -> PathBuf {
 
 fn tun_network_snapshot_path(runtime: &HelperRuntime) -> PathBuf {
     runtime.state_dir.join("tun-network-snapshot.json")
-}
-
-fn legacy_tun_network_snapshot_path(state_path: &Path) -> PathBuf {
-    state_path
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .join("tun-network-snapshot.json")
 }
 
 fn snapshot_tun_network_state(path: &Path) -> AtrResult<()> {
@@ -888,11 +786,11 @@ fn cleanup_tun_routes() {
         .args(["-n", "delete", "-host", "198.18.0.1"])
         .output();
     let state_path = managed_routes_state_path();
-    if let Ok(data) = fs::read_to_string(&state_path) {
-        if let Ok(routes) = serde_json::from_str::<Vec<String>>(&data) {
-            for cidr in routes {
-                delete_route_cidr(&cidr);
-            }
+    if let Ok(data) = fs::read_to_string(&state_path)
+        && let Ok(routes) = serde_json::from_str::<Vec<String>>(&data)
+    {
+        for cidr in routes {
+            delete_route_cidr(&cidr);
         }
     }
     let _ = fs::remove_file(state_path);
@@ -1029,10 +927,11 @@ fn discover_tun_name() -> AtrResult<String> {
     let text = command_text("/usr/sbin/netstat", &["-rn", "-f", "inet"])?;
     for line in text.lines() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() >= 4 && fields[0] == "10.0.0.1" {
-            if let Some(iface) = fields.last().filter(|iface| iface.starts_with("utun")) {
-                return Ok((*iface).to_string());
-            }
+        if fields.len() >= 4
+            && fields[0] == "10.0.0.1"
+            && let Some(iface) = fields.last().filter(|iface| iface.starts_with("utun"))
+        {
+            return Ok((*iface).to_string());
         }
     }
     let text = command_text("/sbin/ifconfig", &[])?;
@@ -1078,19 +977,19 @@ fn configure_scoped_dns_resolvers(domains: &[String], server: &str) -> AtrResult
 
 fn cleanup_scoped_dns_resolvers() {
     let state_path = scoped_dns_state_path();
-    if let Ok(data) = fs::read_to_string(&state_path) {
-        if let Ok(domains) = serde_json::from_str::<Vec<String>>(&data) {
-            for domain in domains {
-                if domain.contains('/') || domain == "." || domain == ".." {
-                    continue;
-                }
-                let path = Path::new("/etc/resolver").join(domain);
-                helper_log!(
-                    "[NulConnect][Helper][Tun] remove scoped DNS resolver {}",
-                    path.display()
-                );
-                let _ = fs::remove_file(path);
+    if let Ok(data) = fs::read_to_string(&state_path)
+        && let Ok(domains) = serde_json::from_str::<Vec<String>>(&data)
+    {
+        for domain in domains {
+            if domain.contains('/') || domain == "." || domain == ".." {
+                continue;
             }
+            let path = Path::new("/etc/resolver").join(domain);
+            helper_log!(
+                "[NulConnect][Helper][Tun] remove scoped DNS resolver {}",
+                path.display()
+            );
+            let _ = fs::remove_file(path);
         }
     }
     let _ = fs::remove_file(state_path);
