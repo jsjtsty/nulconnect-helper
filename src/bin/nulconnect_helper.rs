@@ -390,11 +390,19 @@ fn helper_status(runtime: &HelperRuntime) -> AtrResult<Value> {
         } else {
             let guard = runtime.tun_engine.lock().unwrap();
             if let Some(engine) = guard.as_ref() {
-                if engine.status() == VpnEngineStatus::Stopped {
-                    json!({ "status": "stopping" })
+                let status = if engine.status() == VpnEngineStatus::Stopped {
+                    "stopping"
                 } else {
-                    json!({ "status": "running" })
-                }
+                    "running"
+                };
+                let stats = engine.traffic_stats();
+                json!({
+                    "status": status,
+                    "upload_bytes": stats.upload_bytes,
+                    "download_bytes": stats.download_bytes,
+                    "upload_packets": stats.upload_packets,
+                    "download_packets": stats.download_packets,
+                })
             } else {
                 json!({ "status": "stopped" })
             }

@@ -5,7 +5,7 @@ use reatrust::{
 };
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,6 +69,14 @@ pub enum VpnEngineStatus {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VpnEngineTrafficStats {
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub upload_packets: u64,
+    pub download_packets: u64,
+}
+
 pub struct VpnEngine {
     inner: VpnEngineImpl,
 }
@@ -80,6 +88,10 @@ struct VpnEngineImpl {
     keep_alive: Arc<KeepAliveService>,
     monitor_wake: Arc<(Mutex<()>, Condvar)>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
+    upload_bytes: Arc<AtomicU64>,
+    download_bytes: Arc<AtomicU64>,
+    upload_packets: Arc<AtomicU64>,
+    download_packets: Arc<AtomicU64>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
@@ -118,6 +130,15 @@ impl VpnEngine {
         }
         result
     }
+
+    pub fn traffic_stats(&self) -> VpnEngineTrafficStats {
+        VpnEngineTrafficStats {
+            upload_bytes: self.inner.upload_bytes.load(Ordering::Relaxed),
+            download_bytes: self.inner.download_bytes.load(Ordering::Relaxed),
+            upload_packets: self.inner.upload_packets.load(Ordering::Relaxed),
+            download_packets: self.inner.download_packets.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Drop for VpnEngine {
@@ -142,6 +163,10 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     let close = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
     let monitor_wake = Arc::new((Mutex::new(()), Condvar::new()));
+    let upload_bytes = Arc::new(AtomicU64::new(0));
+    let download_bytes = Arc::new(AtomicU64::new(0));
+    let upload_packets = Arc::new(AtomicU64::new(0));
+    let download_packets = Arc::new(AtomicU64::new(0));
 
     helper_debug_log("start: spawning uplink worker");
     let tun_to_l3 = spawn_tun_to_l3(
@@ -152,6 +177,8 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
         interrupt.clone(),
         config.packet_information,
         config.exit_on_fatal_error,
+        upload_bytes.clone(),
+        upload_packets.clone(),
     )?;
     helper_debug_log("start: spawning downlink worker");
     let l3_to_tun = spawn_l3_to_tun(
@@ -161,6 +188,8 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
         result.clone(),
         config.packet_information,
         config.exit_on_fatal_error,
+        download_bytes.clone(),
+        download_packets.clone(),
     )?;
     let keep_alive_monitor = spawn_keep_alive_monitor(
         keep_alive.clone(),
@@ -180,6 +209,10 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
             keep_alive,
             monitor_wake,
             result,
+            upload_bytes,
+            download_bytes,
+            upload_packets,
+            download_packets,
             workers: Mutex::new(vec![tun_to_l3, l3_to_tun, keep_alive_monitor]),
         },
     })
@@ -319,6 +352,8 @@ fn spawn_tun_to_l3(
     interrupt: Arc<InterruptEvent>,
     packet_information: bool,
     exit_on_fatal_error: bool,
+    upload_bytes: Arc<AtomicU64>,
+    upload_packets: Arc<AtomicU64>,
 ) -> AtrResult<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("nulconnect-l3-uplink".to_string())
@@ -350,8 +385,10 @@ fn spawn_tun_to_l3(
                                 ));
                             }
                             match tunnel.write_packet(packet).map_err(map_reatrust_error) {
-                                Ok(_) => {
+                                Ok(written) => {
                                     written_packets += 1;
+                                    upload_bytes.fetch_add(written as u64, Ordering::Relaxed);
+                                    upload_packets.fetch_add(1, Ordering::Relaxed);
                                     if read_packets <= 8 {
                                         helper_debug_log(&format!(
                                             "uplink-write: ready packet #{read_packets} elapsed_ms={}",
@@ -416,6 +453,8 @@ fn spawn_l3_to_tun(
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
     packet_information: bool,
     exit_on_fatal_error: bool,
+    download_bytes: Arc<AtomicU64>,
+    download_packets: Arc<AtomicU64>,
 ) -> AtrResult<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("nulconnect-l3-downlink".to_string())
@@ -430,6 +469,8 @@ fn spawn_l3_to_tun(
                         match device.send(&tun_packet) {
                             Ok(_) => {
                                 packets += 1;
+                                download_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                                download_packets.fetch_add(1, Ordering::Relaxed);
                                 log_packet_sample(
                                     "downlink",
                                     packets,
