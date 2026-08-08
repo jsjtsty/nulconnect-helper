@@ -1,12 +1,11 @@
 use crate::error::{AtrError, AtrResult};
 use reatrust::{
-    AtrClient, ClientConfig, CookieRecord, KeepAliveConfig, KeepAliveService, L3Tunnel,
-    SessionMaterial, parse_resource_bytes,
+    AtrClient, ClientConfig, CookieRecord, L3Tunnel, SessionMaterial, parse_resource_bytes,
 };
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tun_rs::{DeviceBuilder, InterruptEvent, Layer, PACKET_INFORMATION_LENGTH};
@@ -85,8 +84,6 @@ struct VpnEngineImpl {
     close: Arc<AtomicBool>,
     interrupt: Arc<InterruptEvent>,
     tunnel: Arc<L3Tunnel>,
-    keep_alive: Arc<KeepAliveService>,
-    monitor_wake: Arc<(Mutex<()>, Condvar)>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
     upload_bytes: Arc<AtomicU64>,
     download_bytes: Arc<AtomicU64>,
@@ -109,8 +106,6 @@ impl VpnEngine {
     pub fn cancel(&self) {
         self.inner.close.store(true, Ordering::SeqCst);
         let _ = self.inner.interrupt.trigger();
-        self.inner.monitor_wake.1.notify_all();
-        self.inner.keep_alive.stop();
         let _ = self.inner.tunnel.close();
     }
 
@@ -156,13 +151,11 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     helper_debug_log("start: TUN device built");
     let interrupt = Arc::new(InterruptEvent::new()?);
     helper_debug_log("start: opening libreatrust L3 tunnel");
-    let (tunnel, keep_alive) = build_l3_runtime(&config)?;
+    let tunnel = build_l3_runtime(&config)?;
     let tunnel = Arc::new(tunnel);
-    let keep_alive = Arc::new(keep_alive);
     helper_debug_log("start: libreatrust L3 tunnel opened");
     let close = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
-    let monitor_wake = Arc::new((Mutex::new(()), Condvar::new()));
     let upload_bytes = Arc::new(AtomicU64::new(0));
     let download_bytes = Arc::new(AtomicU64::new(0));
     let upload_packets = Arc::new(AtomicU64::new(0));
@@ -191,14 +184,6 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
         download_bytes.clone(),
         download_packets.clone(),
     )?;
-    let keep_alive_monitor = spawn_keep_alive_monitor(
-        keep_alive.clone(),
-        tunnel.clone(),
-        close.clone(),
-        result.clone(),
-        interrupt.clone(),
-        monitor_wake.clone(),
-    )?;
     helper_debug_log("start: workers spawned");
 
     Ok(VpnEngine {
@@ -206,67 +191,17 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
             close,
             interrupt,
             tunnel,
-            keep_alive,
-            monitor_wake,
             result,
             upload_bytes,
             download_bytes,
             upload_packets,
             download_packets,
-            workers: Mutex::new(vec![tun_to_l3, l3_to_tun, keep_alive_monitor]),
+            workers: Mutex::new(vec![tun_to_l3, l3_to_tun]),
         },
     })
 }
 
-fn spawn_keep_alive_monitor(
-    keep_alive: Arc<KeepAliveService>,
-    tunnel: Arc<L3Tunnel>,
-    close: Arc<AtomicBool>,
-    result: Arc<Mutex<Option<AtrResult<usize>>>>,
-    interrupt: Arc<InterruptEvent>,
-    wake: Arc<(Mutex<()>, Condvar)>,
-) -> AtrResult<thread::JoinHandle<()>> {
-    thread::Builder::new()
-        .name("nulconnect-keep-alive-monitor".to_string())
-        .spawn(move || {
-            while !close.load(Ordering::SeqCst) {
-                let (lock, condvar) = &*wake;
-                let guard = lock.lock().unwrap();
-                let _ = condvar
-                    .wait_timeout_while(guard, Duration::from_secs(30), |_| {
-                        !close.load(Ordering::SeqCst)
-                    })
-                    .unwrap();
-                if close.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                let Some(message) = keep_alive.status().last_error else {
-                    continue;
-                };
-                if !is_session_invalidation_message(&message) {
-                    continue;
-                }
-
-                set_result(&result, Err(AtrError::Unauthorized(message)));
-                close.store(true, Ordering::SeqCst);
-                let _ = interrupt.trigger();
-                let _ = tunnel.close();
-                keep_alive.stop();
-                break;
-            }
-        })
-        .map_err(|err| AtrError::Internal(format!("failed to start keep-alive monitor: {err}")))
-}
-
-fn is_session_invalidation_message(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("invalid sid")
-        || normalized.contains("not logged in")
-        || normalized.contains("unauthorized")
-}
-
-fn build_l3_runtime(config: &VpnEngineConfig) -> AtrResult<(L3Tunnel, KeepAliveService)> {
+fn build_l3_runtime(config: &VpnEngineConfig) -> AtrResult<L3Tunnel> {
     helper_debug_log(&format!(
         "open_l3: client server={}:{} service_host={} resource_bytes={}",
         config.client.server_host,
@@ -277,9 +212,7 @@ fn build_l3_runtime(config: &VpnEngineConfig) -> AtrResult<(L3Tunnel, KeepAliveS
     let client = build_atr_client(config)?;
     helper_debug_log("open_l3: calling client.open_l3_tunnel");
     let tunnel = client.open_l3_tunnel().map_err(map_reatrust_error)?;
-    let keep_alive =
-        KeepAliveService::start(client, KeepAliveConfig::default()).map_err(map_reatrust_error)?;
-    Ok((tunnel, keep_alive))
+    Ok(tunnel)
 }
 
 fn build_atr_client(config: &VpnEngineConfig) -> AtrResult<AtrClient> {
