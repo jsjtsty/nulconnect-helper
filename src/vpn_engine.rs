@@ -610,5 +610,8 @@ impl From<VpnCookieRecord> for CookieRecord {
 }
 
 fn helper_debug_log(message: &str) {
+    #[cfg(feature = "verbose-logs")]
     eprintln!("[NulConnect][L3] {message}");
+    #[cfg(not(feature = "verbose-logs"))]
+    let _ = message;
 }

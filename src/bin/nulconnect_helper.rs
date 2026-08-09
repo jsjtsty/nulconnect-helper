@@ -24,11 +24,35 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SOCKET_PATH: &str = "/var/run/nulconnect-helper.sock";
 const DEFAULT_STATE_DIR: &str = "/Library/Application Support/NulConnect";
+#[cfg(feature = "verbose-logs")]
+const HELPER_LOG_PATH: &str = "/Library/Application Support/NulConnect/nulconnect-helper.log";
 
+#[cfg(feature = "verbose-logs")]
 macro_rules! helper_log {
     ($($arg:tt)*) => {
-        eprintln!("[{}] {}", now_unix_secs(), format_args!($($arg)*));
+        #[cfg(feature = "verbose-logs")]
+        helper_log_line(format!("[{}] {}", now_unix_secs(), format_args!($($arg)*)));
     };
+}
+
+#[cfg(not(feature = "verbose-logs"))]
+macro_rules! helper_log {
+    ($($arg:tt)*) => {{
+        let _ = format_args!($($arg)*);
+    }};
+}
+
+#[cfg(feature = "verbose-logs")]
+fn helper_log_line(line: String) {
+    eprintln!("{line}");
+    let _ = fs::create_dir_all(DEFAULT_STATE_DIR);
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(HELPER_LOG_PATH)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1243,6 +1267,7 @@ fn flush_dns_cache() {
         .output();
 }
 
+#[cfg(feature = "verbose-logs")]
 fn log_tun_network_state(label: &str) {
     helper_log!("[NulConnect][Helper][Tun][Diag] {label}");
     log_command_output(
@@ -1295,6 +1320,10 @@ fn log_tun_network_state(label: &str) {
     );
 }
 
+#[cfg(not(feature = "verbose-logs"))]
+fn log_tun_network_state(_label: &str) {}
+
+#[cfg(feature = "verbose-logs")]
 fn log_command_output(label: &str, command: &mut Command, stdin_data: Option<&[u8]>) {
     let output = if let Some(stdin_data) = stdin_data {
         match command.spawn() {

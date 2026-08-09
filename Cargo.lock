@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "nulconnect-helper"
-version = "0.1.16"
+version = "0.1.18"
 dependencies = [
  "base64",
  "libc",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "reatrust"
-version = "0.1.0"
+version = "0.1.6"
 dependencies = [
  "libreatrust-core",
 ]

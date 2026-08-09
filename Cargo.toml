@@ -1,6 +1,6 @@
 [package]
 name = "nulconnect-helper"
-version = "0.1.16"
+version = "0.1.18"
 edition = "2024"
 
 [lib]
@@ -30,4 +30,4 @@ reatrust = { path = "../libreatrust" }
 
 [features]
 default = []
-verbose-logs = []
+verbose-logs = ["reatrust/verbose-logs"]
