@@ -834,12 +834,21 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
         return Ok(());
     }
 
+    // A previous implementation could leave the DNS host route behind when
+    // the connection was interrupted. Remove only routes recorded as ours
+    // before calculating the new route set.
+    cleanup_tun_routes();
     let tun_name = discover_tun_name()?;
     configure_scoped_dns_resolvers(&config.managed_domains, &config.dns_addr)?;
 
     let mut routes = config.managed_route_cidrs.clone();
-    if !config.dns_addr.trim().is_empty() {
+    if should_route_dns_via_tun(&config.dns_addr) {
         routes.push(format!("{}/32", config.dns_addr.trim()));
+    } else if !config.dns_addr.trim().is_empty() {
+        helper_log!(
+            "[NulConnect][Helper][Tun] keeping DNS {} on the physical interface",
+            config.dns_addr.trim()
+        );
     }
     routes.extend(config.managed_route_cidrs.iter().cloned());
     routes.sort();
@@ -889,6 +898,25 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
         config.managed_domains.len()
     );
     Ok(())
+}
+
+fn should_route_dns_via_tun(server: &str) -> bool {
+    let server = server.trim();
+    if server.is_empty() {
+        return false;
+    }
+    let Ok(server_ip) = server.parse::<Ipv4Addr>() else {
+        return true;
+    };
+
+    // When the configured resolver is the LAN's default gateway, it is a
+    // local resolver. Routing it into the VPN prevents the host from reaching
+    // the router and makes ordinary DNS lookups time out. Remote/private DNS
+    // servers remain eligible for the VPN route.
+    match default_ipv4_gateway() {
+        Ok(gateway) if gateway.parse::<Ipv4Addr>().ok() == Some(server_ip) => false,
+        _ => true,
+    }
 }
 
 fn node_route_cidrs(config: &HelperConfig) -> AtrResult<Vec<String>> {

@@ -1,6 +1,6 @@
 [package]
 name = "nulconnect-helper"
-version = "0.1.18"
+version = "0.2.0"
 edition = "2024"
 
 [lib]
@@ -30,6 +30,7 @@ serde_json = "1"
 thiserror = "2"
 url = "2"
 reatrust = { path = "../libreatrust" }
+smoltcp = { version = "0.13.1", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ip", "alloc"] }
 
 [features]
 default = []

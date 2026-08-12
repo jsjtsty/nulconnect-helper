@@ -1,4 +1,5 @@
 mod error;
+mod tun_stack;
 mod vpn_engine;
 
 #[cfg(windows)]

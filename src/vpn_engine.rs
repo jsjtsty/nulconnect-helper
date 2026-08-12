@@ -1,4 +1,5 @@
 use crate::error::{AtrError, AtrResult};
+use crate::tun_stack::TunProtocolStack;
 use reatrust::{
     AtrClient, ClientConfig, CookieRecord, L3Tunnel, SessionMaterial, parse_resource_bytes,
 };
@@ -83,7 +84,7 @@ pub struct VpnEngine {
     inner: VpnEngineImpl,
 }
 
-trait TunIo: Send + Sync {
+pub(crate) trait TunIo: Send + Sync {
     fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize>;
     fn send_packet(&self, packet: &[u8]) -> std::io::Result<()>;
 }
@@ -120,6 +121,7 @@ struct VpnEngineImpl {
     #[cfg(not(target_os = "windows"))]
     interrupt: Arc<InterruptEvent>,
     tunnel: Arc<L3Tunnel>,
+    protocol_stack: Option<Arc<TunProtocolStack>>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
     upload_bytes: Arc<AtomicU64>,
     download_bytes: Arc<AtomicU64>,
@@ -141,6 +143,9 @@ impl VpnEngine {
 
     pub fn cancel(&self) {
         self.inner.close.store(true, Ordering::SeqCst);
+        if let Some(stack) = &self.inner.protocol_stack {
+            stack.stop();
+        }
         #[cfg(not(target_os = "windows"))]
         let _ = self.inner.interrupt.trigger();
         let _ = self.inner.tunnel.close();
@@ -192,7 +197,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     let device = build_tun_device(&config, local_ip, interrupt.clone())?;
     helper_debug_log("start: TUN device built");
     helper_debug_log("start: opening libreatrust L3 tunnel");
-    let tunnel = build_l3_runtime(&config)?;
+    let (client, tunnel) = build_l3_runtime(&config)?;
     let tunnel = Arc::new(tunnel);
     helper_debug_log("start: libreatrust L3 tunnel opened");
     let close = Arc::new(AtomicBool::new(false));
@@ -202,10 +207,24 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     let upload_packets = Arc::new(AtomicU64::new(0));
     let download_packets = Arc::new(AtomicU64::new(0));
 
+    let protocol_stack = Arc::new(TunProtocolStack::start(
+        client,
+        local_ip,
+        device.clone(),
+        close.clone(),
+        tunnel.clone(),
+        config.packet_information,
+        upload_bytes.clone(),
+        upload_packets.clone(),
+        download_bytes.clone(),
+        download_packets.clone(),
+    )?);
+
     helper_debug_log("start: spawning uplink worker");
     let tun_to_l3 = spawn_tun_to_l3(
         device.clone(),
         tunnel.clone(),
+        protocol_stack.clone(),
         close.clone(),
         result.clone(),
         #[cfg(not(target_os = "windows"))]
@@ -234,6 +253,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
             #[cfg(not(target_os = "windows"))]
             interrupt,
             tunnel,
+            protocol_stack: Some(protocol_stack),
             result,
             upload_bytes,
             download_bytes,
@@ -244,7 +264,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     })
 }
 
-fn build_l3_runtime(config: &VpnEngineConfig) -> AtrResult<L3Tunnel> {
+fn build_l3_runtime(config: &VpnEngineConfig) -> AtrResult<(AtrClient, L3Tunnel)> {
     helper_debug_log(&format!(
         "open_l3: client server={}:{} service_host={} resource_bytes={}",
         config.client.server_host,
@@ -255,7 +275,7 @@ fn build_l3_runtime(config: &VpnEngineConfig) -> AtrResult<L3Tunnel> {
     let client = build_atr_client(config)?;
     helper_debug_log("open_l3: calling client.open_l3_tunnel");
     let tunnel = client.open_l3_tunnel().map_err(map_reatrust_error)?;
-    Ok(tunnel)
+    Ok((client, tunnel))
 }
 
 fn build_atr_client(config: &VpnEngineConfig) -> AtrResult<AtrClient> {
@@ -339,6 +359,7 @@ fn build_tun_device(
 fn spawn_tun_to_l3(
     device: Arc<dyn TunIo>,
     tunnel: Arc<L3Tunnel>,
+    protocol_stack: Arc<TunProtocolStack>,
     close: Arc<AtomicBool>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
     #[cfg(not(target_os = "windows"))] interrupt: Arc<InterruptEvent>,
@@ -371,6 +392,9 @@ fn spawn_tun_to_l3(
                                 &mut samples,
                                 packet_information,
                             );
+                            if protocol_stack.accept_packet(packet.to_vec()) {
+                                continue;
+                            }
                             let start = Instant::now();
                             if read_packets <= 8 {
                                 helper_debug_log(&format!(
@@ -402,9 +426,7 @@ fn spawn_tun_to_l3(
                                     ));
                                 }
                                 Err(err) => {
-                                    close.store(true, Ordering::SeqCst);
-                                    let _ = tunnel.close();
-                                    set_result(&result, Err(err));
+                                    fail_engine(&result, &close, &tunnel, err);
                                     return;
                                 }
                             }
@@ -414,20 +436,27 @@ fn spawn_tun_to_l3(
                             helper_debug_log(&format!("uplink packet ignored: {err}"));
                         }
                         Err(err) => {
-                            close.store(true, Ordering::SeqCst);
-                            let _ = tunnel.close();
-                            set_result(&result, Err(err));
+                            fail_engine(&result, &close, &tunnel, err);
                             return;
                         }
                     },
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                     }
-                    Err(err) if err.kind() == ErrorKind::Interrupted => break,
+                    Err(err)
+                        if err.kind() == ErrorKind::Interrupted
+                            && close.load(Ordering::SeqCst) =>
+                    {
+                        break;
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                     Err(err) => {
-                        close.store(true, Ordering::SeqCst);
-                        let _ = tunnel.close();
-                        set_result(&result, Err(AtrError::NetworkFailed(err.to_string())));
+                        fail_engine(
+                            &result,
+                            &close,
+                            &tunnel,
+                            AtrError::NetworkFailed(err.to_string()),
+                        );
                         return;
                     }
                 }
@@ -435,7 +464,14 @@ fn spawn_tun_to_l3(
             helper_debug_log(&format!(
                 "uplink: worker stopped read_packets={read_packets} written_packets={written_packets}"
             ));
-            set_result(&result, Ok(written_packets));
+            if !close.load(Ordering::SeqCst) {
+                fail_engine(
+                    &result,
+                    &close,
+                    &tunnel,
+                    AtrError::NetworkFailed("L3 uplink worker stopped unexpectedly".into()),
+                );
+            }
         })
         .map_err(|err| AtrError::Internal(format!("failed to start L3 uplink worker: {err}")))
 }
@@ -481,9 +517,12 @@ fn spawn_l3_to_tun(
                                 helper_debug_log(&format!("downlink packet dropped: {err}"));
                             }
                             Err(err) => {
-                                close.store(true, Ordering::SeqCst);
-                                let _ = tunnel.close();
-                                set_result(&result, Err(AtrError::NetworkFailed(err.to_string())));
+                                fail_engine(
+                                    &result,
+                                    &close,
+                                    &tunnel,
+                                    AtrError::NetworkFailed(err.to_string()),
+                                );
                                 return;
                             }
                         }
@@ -494,14 +533,20 @@ fn spawn_l3_to_tun(
                         thread::sleep(Duration::from_millis(20));
                     }
                     Err(err) => {
-                        close.store(true, Ordering::SeqCst);
-                        set_result(&result, Err(err));
+                        fail_engine(&result, &close, &tunnel, err);
                         return;
                     }
                 }
             }
             helper_debug_log(&format!("downlink: worker stopped packets={packets}"));
-            set_result(&result, Ok(packets));
+            if !close.load(Ordering::SeqCst) {
+                fail_engine(
+                    &result,
+                    &close,
+                    &tunnel,
+                    AtrError::NetworkFailed("L3 downlink worker stopped unexpectedly".into()),
+                );
+            }
         })
         .map_err(|err| AtrError::Internal(format!("failed to start L3 downlink worker: {err}")))
 }
@@ -519,7 +564,7 @@ fn strip_packet_information(packet: &[u8], enabled: bool) -> AtrResult<&[u8]> {
     Ok(&packet[PACKET_INFORMATION_LENGTH..])
 }
 
-fn add_packet_information(packet: &[u8], enabled: bool) -> Vec<u8> {
+pub(crate) fn add_packet_information(packet: &[u8], enabled: bool) -> Vec<u8> {
     if !enabled {
         return packet.to_vec();
     }
@@ -638,6 +683,20 @@ fn set_result(slot: &Arc<Mutex<Option<AtrResult<usize>>>>, value: AtrResult<usiz
     if guard.is_none() {
         *guard = Some(value);
     }
+}
+
+fn fail_engine(
+    result: &Arc<Mutex<Option<AtrResult<usize>>>>,
+    close: &Arc<AtomicBool>,
+    tunnel: &Arc<L3Tunnel>,
+    error: AtrError,
+) {
+    // Publish the real failure before waking the peer worker. Otherwise the
+    // peer can observe `close` first and overwrite the error with a normal
+    // stopped result while tunnel shutdown is still in progress.
+    set_result(result, Err(error));
+    close.store(true, Ordering::SeqCst);
+    let _ = tunnel.close();
 }
 
 fn map_reatrust_error(err: reatrust::AtrError) -> AtrError {
