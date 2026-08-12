@@ -10,6 +10,11 @@ crate-type = ["rlib", "staticlib"]
 name = "nulconnect-helper"
 path = "src/bin/nulconnect_helper.rs"
 
+[[bin]]
+name = "nulconnect-helper-service"
+path = "src/bin/windows_service.rs"
+required-features = ["windows-service"]
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
@@ -23,11 +28,26 @@ rsa = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tun-rs = { version = "2", features = ["interruptible"] }
 url = "2"
-libc = "0.2"
 reatrust = { path = "../libreatrust" }
 
 [features]
 default = []
 verbose-logs = ["reatrust/verbose-logs"]
+windows-service = []
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"
+tun-rs = { version = "2", features = ["interruptible"] }

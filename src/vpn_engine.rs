@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tun_rs::{DeviceBuilder, InterruptEvent, Layer, PACKET_INFORMATION_LENGTH};
+#[cfg(not(target_os = "windows"))]
+use tun_rs::{DeviceBuilder, InterruptEvent, Layer};
+
+const PACKET_INFORMATION_LENGTH: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct VpnCookieRecord {
@@ -80,8 +83,41 @@ pub struct VpnEngine {
     inner: VpnEngineImpl,
 }
 
+trait TunIo: Send + Sync {
+    fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize>;
+    fn send_packet(&self, packet: &[u8]) -> std::io::Result<()>;
+}
+
+#[cfg(not(target_os = "windows"))]
+struct TunRsDevice {
+    device: tun_rs::SyncDevice,
+    interrupt: Arc<InterruptEvent>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl TunIo for TunRsDevice {
+    fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.device.recv_intr(buffer, &self.interrupt)
+    }
+
+    fn send_packet(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.device.send(packet).map(|_| ())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl TunIo for crate::platform::windows::WintunTunDevice {
+    fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.receive(buffer)
+    }
+    fn send_packet(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.send_packet(packet)
+    }
+}
+
 struct VpnEngineImpl {
     close: Arc<AtomicBool>,
+    #[cfg(not(target_os = "windows"))]
     interrupt: Arc<InterruptEvent>,
     tunnel: Arc<L3Tunnel>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
@@ -105,6 +141,7 @@ impl VpnEngine {
 
     pub fn cancel(&self) {
         self.inner.close.store(true, Ordering::SeqCst);
+        #[cfg(not(target_os = "windows"))]
         let _ = self.inner.interrupt.trigger();
         let _ = self.inner.tunnel.close();
     }
@@ -147,9 +184,13 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     let local_ip = request_l3_virtual_ip(&config)?;
     helper_debug_log(&format!("start: L3 virtual IP={local_ip}"));
     helper_debug_log("start: building TUN device");
-    let device = Arc::new(build_tun_device(&config, local_ip)?);
-    helper_debug_log("start: TUN device built");
+    #[cfg(not(target_os = "windows"))]
     let interrupt = Arc::new(InterruptEvent::new()?);
+    #[cfg(target_os = "windows")]
+    let device = build_tun_device(&config, local_ip)?;
+    #[cfg(not(target_os = "windows"))]
+    let device = build_tun_device(&config, local_ip, interrupt.clone())?;
+    helper_debug_log("start: TUN device built");
     helper_debug_log("start: opening libreatrust L3 tunnel");
     let tunnel = build_l3_runtime(&config)?;
     let tunnel = Arc::new(tunnel);
@@ -167,6 +208,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
         tunnel.clone(),
         close.clone(),
         result.clone(),
+        #[cfg(not(target_os = "windows"))]
         interrupt.clone(),
         config.packet_information,
         config.exit_on_fatal_error,
@@ -189,6 +231,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     Ok(VpnEngine {
         inner: VpnEngineImpl {
             close,
+            #[cfg(not(target_os = "windows"))]
             interrupt,
             tunnel,
             result,
@@ -240,7 +283,23 @@ fn request_l3_virtual_ip(config: &VpnEngineConfig) -> AtrResult<Ipv4Addr> {
         .ok_or_else(|| AtrError::NetworkFailed("server did not return L3 virtual IP".into()))
 }
 
-fn build_tun_device(config: &VpnEngineConfig, local_ip: Ipv4Addr) -> AtrResult<tun_rs::SyncDevice> {
+#[cfg(target_os = "windows")]
+fn build_tun_device(config: &VpnEngineConfig, _local_ip: Ipv4Addr) -> AtrResult<Arc<dyn TunIo>> {
+    let device = crate::platform::windows::WintunTunDevice::open(
+        None,
+        config.tun_name.as_deref().unwrap_or("NulConnect"),
+        _local_ip,
+    )
+    .map_err(AtrError::NetworkFailed)?;
+    Ok(Arc::new(device))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_tun_device(
+    config: &VpnEngineConfig,
+    local_ip: Ipv4Addr,
+    interrupt: Arc<InterruptEvent>,
+) -> AtrResult<Arc<dyn TunIo>> {
     helper_debug_log(&format!(
         "tun: build requested name={} mtu={} local_ip={} packet_information={}",
         config.tun_name.as_deref().unwrap_or("auto"),
@@ -265,7 +324,7 @@ fn build_tun_device(config: &VpnEngineConfig, local_ip: Ipv4Addr) -> AtrResult<t
             });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         builder = builder.packet_information(config.packet_information);
     }
@@ -274,20 +333,22 @@ fn build_tun_device(config: &VpnEngineConfig, local_ip: Ipv4Addr) -> AtrResult<t
         .build_sync()
         .map_err(|err| AtrError::NetworkFailed(format!("failed to create TUN device: {err}")))?;
     helper_debug_log("tun: build_sync succeeded");
-    Ok(device)
+    Ok(Arc::new(TunRsDevice { device, interrupt }))
 }
 
 fn spawn_tun_to_l3(
-    device: Arc<tun_rs::SyncDevice>,
+    device: Arc<dyn TunIo>,
     tunnel: Arc<L3Tunnel>,
     close: Arc<AtomicBool>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
-    interrupt: Arc<InterruptEvent>,
+    #[cfg(not(target_os = "windows"))] interrupt: Arc<InterruptEvent>,
     packet_information: bool,
     exit_on_fatal_error: bool,
     upload_bytes: Arc<AtomicU64>,
     upload_packets: Arc<AtomicU64>,
 ) -> AtrResult<thread::JoinHandle<()>> {
+    #[cfg(not(target_os = "windows"))]
+    let _ = interrupt;
     thread::Builder::new()
         .name("nulconnect-l3-uplink".to_string())
         .spawn(move || {
@@ -297,7 +358,7 @@ fn spawn_tun_to_l3(
             let mut samples = 0usize;
             let mut buf = vec![0u8; 65_535];
             while !close.load(Ordering::SeqCst) {
-                match device.recv_intr(&mut buf, &interrupt) {
+                match device.receive(&mut buf) {
                     Ok(0) => continue,
                     Ok(n) => match strip_packet_information(&buf[..n], packet_information) {
                         Ok(packet) => {
@@ -380,7 +441,7 @@ fn spawn_tun_to_l3(
 }
 
 fn spawn_l3_to_tun(
-    device: Arc<tun_rs::SyncDevice>,
+    device: Arc<dyn TunIo>,
     tunnel: Arc<L3Tunnel>,
     close: Arc<AtomicBool>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
@@ -399,7 +460,7 @@ fn spawn_l3_to_tun(
                 match tunnel.read_packet().map_err(map_reatrust_error) {
                     Ok(packet) => {
                         let tun_packet = add_packet_information(&packet, packet_information);
-                        match device.send(&tun_packet) {
+                        match device.send_packet(&tun_packet) {
                             Ok(_) => {
                                 packets += 1;
                                 download_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
@@ -487,14 +548,15 @@ fn packet_information_header(packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
         (family as u32).to_be_bytes()
     }
 
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "openbsd",
-        target_os = "freebsd",
-        target_os = "netbsd",
-    )))]
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "tvos"),
+        not(target_os = "openbsd"),
+        not(target_os = "freebsd"),
+        not(target_os = "netbsd"),
+    ))]
     {
         const ETH_P_IP: [u8; PACKET_INFORMATION_LENGTH] = (libc::ETH_P_IP as u32).to_be_bytes();
         const ETH_P_IPV6: [u8; PACKET_INFORMATION_LENGTH] = (libc::ETH_P_IPV6 as u32).to_be_bytes();
@@ -503,6 +565,14 @@ fn packet_information_header(packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
         } else {
             ETH_P_IP
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Wintun exposes raw IP packets and does not use the Unix packet
+        // information header. Keep this fallback for callers that enable the
+        // legacy option while the native Wintun path is being integrated.
+        [0, 0, 0, 0]
     }
 }
 
