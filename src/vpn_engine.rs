@@ -577,7 +577,7 @@ pub(crate) fn add_packet_information(packet: &[u8], enabled: bool) -> Vec<u8> {
     result
 }
 
-fn packet_information_header(packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
+fn packet_information_header(_packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -587,7 +587,7 @@ fn packet_information_header(packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
         target_os = "netbsd",
     ))]
     {
-        let family = if packet.first().map(|byte| byte >> 4) == Some(6) {
+        let family = if _packet.first().map(|byte| byte >> 4) == Some(6) {
             libc::AF_INET6
         } else {
             libc::AF_INET
@@ -607,7 +607,7 @@ fn packet_information_header(packet: &[u8]) -> [u8; PACKET_INFORMATION_LENGTH] {
     {
         const ETH_P_IP: [u8; PACKET_INFORMATION_LENGTH] = (libc::ETH_P_IP as u32).to_be_bytes();
         const ETH_P_IPV6: [u8; PACKET_INFORMATION_LENGTH] = (libc::ETH_P_IPV6 as u32).to_be_bytes();
-        if packet.first().map(|byte| byte >> 4) == Some(6) {
+        if _packet.first().map(|byte| byte >> 4) == Some(6) {
             ETH_P_IPV6
         } else {
             ETH_P_IP

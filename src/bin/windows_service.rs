@@ -12,6 +12,7 @@ use windows_service::service_dispatcher;
 
 const SERVICE_NAME: &str = "NulConnectHelper";
 
+#[allow(dead_code)]
 fn main() {
     if let Err(error) = run() {
         eprintln!("NulConnect Windows Service dispatcher failed: {error}");
