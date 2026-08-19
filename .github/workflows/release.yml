@@ -42,8 +42,16 @@ jobs:
           set -euo pipefail
           ref="$(git ls-remote --tags --refs "$LIBREATRUST_REPOSITORY" 'v*' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
           test -n "$ref"
-          echo "Using libreatrust $ref"
-          git clone --depth 1 --branch "$ref" "$LIBREATRUST_REPOSITORY" ../libreatrust
+          commit="$(git ls-remote "$LIBREATRUST_REPOSITORY" "refs/tags/${ref}^{}" | awk '{print $1}')"
+          if [ -z "$commit" ]; then
+            commit="$(git ls-remote --tags --refs "$LIBREATRUST_REPOSITORY" "refs/tags/$ref" | awk '{print $1}')"
+          fi
+          test -n "$commit"
+          echo "Using libreatrust $ref ($commit)"
+          git init -q ../libreatrust
+          git -C ../libreatrust remote add origin "$LIBREATRUST_REPOSITORY"
+          git -C ../libreatrust fetch --depth 1 origin "$commit"
+          git -C ../libreatrust checkout --detach --quiet "$commit"
 
       - name: Update libreatrust dependency
         run: cargo update -p reatrust
