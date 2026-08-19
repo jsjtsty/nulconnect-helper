@@ -913,10 +913,10 @@ fn should_route_dns_via_tun(server: &str) -> bool {
     // local resolver. Routing it into the VPN prevents the host from reaching
     // the router and makes ordinary DNS lookups time out. Remote/private DNS
     // servers remain eligible for the VPN route.
-    match default_ipv4_gateway() {
-        Ok(gateway) if gateway.parse::<Ipv4Addr>().ok() == Some(server_ip) => false,
-        _ => true,
-    }
+    !matches!(
+        default_ipv4_gateway(),
+        Ok(gateway) if gateway.parse::<Ipv4Addr>().ok() == Some(server_ip)
+    )
 }
 
 fn node_route_cidrs(config: &HelperConfig) -> AtrResult<Vec<String>> {

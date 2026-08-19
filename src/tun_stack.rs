@@ -33,6 +33,7 @@ pub(crate) struct TunProtocolStack {
 }
 
 impl TunProtocolStack {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         client: AtrClient,
         local_ip: Ipv4Addr,
@@ -210,6 +211,7 @@ struct UdpFlow {
     closed: Arc<AtomicBool>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_transport_stack(
     client: AtrClient,
     local_ip: Ipv4Addr,
@@ -254,45 +256,30 @@ fn run_transport_stack(
 
     while !close.load(Ordering::SeqCst) {
         let mut received = false;
-        loop {
-            match input_rx.try_recv() {
-                Ok(packet) => {
-                    if let Some((protocol, destination, port)) = ipv4_protocol_and_port(&packet) {
-                        let managed = match protocol {
-                            6 => matches!(
-                                client.route_tcp(&destination.to_string(), port),
-                                RouteDecision::Managed(_)
-                            ),
-                            17 => matches!(
-                                client.route_udp(&destination.to_string(), port),
-                                RouteDecision::Managed(_)
-                            ),
-                            _ => false,
-                        };
-                        if managed {
-                            managed_ports.insert((protocol, destination, port));
-                            if protocol == 6 {
-                                ensure_tcp_listener(
-                                    &mut sockets,
-                                    &mut tcp_listeners,
-                                    destination,
-                                    port,
-                                );
-                            } else {
-                                ensure_udp_listener(
-                                    &mut sockets,
-                                    &mut udp_listeners,
-                                    destination,
-                                    port,
-                                );
-                            }
-                            phy.enqueue(packet);
-                            received = true;
-                            upload_packets.fetch_add(1, Ordering::Relaxed);
-                        }
+        while let Ok(packet) = input_rx.try_recv() {
+            if let Some((protocol, destination, port)) = ipv4_protocol_and_port(&packet) {
+                let managed = match protocol {
+                    6 => matches!(
+                        client.route_tcp(&destination.to_string(), port),
+                        RouteDecision::Managed(_)
+                    ),
+                    17 => matches!(
+                        client.route_udp(&destination.to_string(), port),
+                        RouteDecision::Managed(_)
+                    ),
+                    _ => false,
+                };
+                if managed {
+                    managed_ports.insert((protocol, destination, port));
+                    if protocol == 6 {
+                        ensure_tcp_listener(&mut sockets, &mut tcp_listeners, destination, port);
+                    } else {
+                        ensure_udp_listener(&mut sockets, &mut udp_listeners, destination, port);
                     }
+                    phy.enqueue(packet);
+                    received = true;
+                    upload_packets.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
 
@@ -410,6 +397,7 @@ fn ensure_udp_listener(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_tcp(
     client: &AtrClient,
     _local_ip: Ipv4Addr,
@@ -529,16 +517,16 @@ fn process_tcp(
         if let Some(remote) = &flow.remote {
             let socket = sockets.get_mut::<tcp::Socket>(handle);
             let mut buf = vec![0u8; 64 * 1024];
-            if let Ok(n) = socket.recv_slice(&mut buf) {
-                if n > 0 {
-                    // remote_tx is consumed by the writer thread once the
-                    // remote tunnel is established.  If it is absent the
-                    // flow is being closed and the bytes are discarded.
-                    if let Some(tx) = &flow.remote_tx {
-                        let _ = tx.send(buf[..n].to_vec());
-                    }
-                    upload_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            if let Ok(n) = socket.recv_slice(&mut buf)
+                && n > 0
+            {
+                // remote_tx is consumed by the writer thread once the
+                // remote tunnel is established.  If it is absent the
+                // flow is being closed and the bytes are discarded.
+                if let Some(tx) = &flow.remote_tx {
+                    let _ = tx.send(buf[..n].to_vec());
                 }
+                upload_bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
             while let Ok(data) = flow.remote_rx.try_recv() {
                 if socket.can_send() {
@@ -565,10 +553,10 @@ fn process_tcp(
         })
         .collect();
     for handle in dead {
-        if let Some(flow) = flows.remove(&handle) {
-            if let Some(remote) = flow.remote {
-                let _ = remote.close();
-            }
+        if let Some(flow) = flows.remove(&handle)
+            && let Some(remote) = flow.remote
+        {
+            let _ = remote.close();
         }
         let _ = sockets.remove(handle);
     }

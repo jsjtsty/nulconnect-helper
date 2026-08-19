@@ -356,6 +356,7 @@ fn build_tun_device(
     Ok(Arc::new(TunRsDevice { device, interrupt }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_tun_to_l3(
     device: Arc<dyn TunIo>,
     tunnel: Arc<L3Tunnel>,
@@ -476,6 +477,7 @@ fn spawn_tun_to_l3(
         .map_err(|err| AtrError::Internal(format!("failed to start L3 uplink worker: {err}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_l3_to_tun(
     device: Arc<dyn TunIo>,
     tunnel: Arc<L3Tunnel>,
