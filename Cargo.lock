@@ -689,7 +689,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libreatrust-core"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "base64",
  "hex",
@@ -708,6 +708,7 @@ dependencies = [
  "socket2",
  "thiserror",
  "url",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 
@@ -876,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "nulconnect-helper"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "libc",
@@ -1180,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "reatrust"
-version = "0.1.9"
+version = "0.2.2"
 dependencies = [
  "libreatrust-core",
 ]
