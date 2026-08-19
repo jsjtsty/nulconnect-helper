@@ -77,7 +77,6 @@ jobs:
           package="dist/nulconnect-helper-${{ matrix.name }}"
           mkdir -p "$package"
           cp target/release/nulconnect-helper "$package/"
-          cp target/release/libnulconnect_helper.a "$package/"
           tar -C dist -czf "nulconnect-helper-${{ matrix.name }}.tar.gz" "nulconnect-helper-${{ matrix.name }}"
 
       - name: Package Windows release asset
