@@ -140,13 +140,10 @@ jobs:
           $package = "dist/nulconnect-helper-${{ matrix.name }}"
           New-Item -ItemType Directory -Force $package | Out-Null
           $files = @(Get-ChildItem target/release -File | Where-Object {
-            $_.Name -match '^(lib)?nulconnect[-_]helper([-_]service)?\.(exe|lib)$'
+            $_.Name -match '^(lib)?nulconnect[-_]helper([-_]service)?\.exe$'
           })
           if (-not ($files | Where-Object { $_.Extension -eq '.exe' })) {
             throw "No Windows helper executable found in target/release"
-          }
-          if (-not ($files | Where-Object { $_.Extension -eq '.lib' })) {
-            throw "No Windows helper library found in target/release"
           }
           Copy-Item $files.FullName $package
           Compress-Archive -Path $package -DestinationPath "nulconnect-helper-${{ matrix.name }}.zip"
