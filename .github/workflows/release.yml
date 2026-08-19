@@ -1,0 +1,118 @@
+name: Helper Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBREATRUST_REPOSITORY: https://github.com/jsjtsty/libreatrust.git
+
+jobs:
+  package:
+    name: Package (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: windows-x86_64
+            os: windows-latest
+          - name: windows-arm64
+            os: windows-11-arm
+
+    steps:
+      - name: Check out helper
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch latest libreatrust release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(git ls-remote --tags --refs "$LIBREATRUST_REPOSITORY" 'v*' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
+          test -n "$ref"
+          echo "Using libreatrust $ref"
+          git clone --depth 1 --branch "$ref" "$LIBREATRUST_REPOSITORY" ../libreatrust
+
+      - name: Update libreatrust dependency
+        run: cargo update -p reatrust
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nulconnect-helper-release-${{ matrix.name }}
+
+      - name: Build macOS helper
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --lib --bin nulconnect-helper
+
+      - name: Build Windows helper and service
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --lib --bins --features windows-service
+
+      - name: Package macOS release asset
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="dist/nulconnect-helper-${{ matrix.name }}"
+          mkdir -p "$package"
+          cp target/release/nulconnect-helper "$package/"
+          cp target/release/libnulconnect_helper.a "$package/"
+          tar -C dist -czf "nulconnect-helper-${{ matrix.name }}.tar.gz" "nulconnect-helper-${{ matrix.name }}"
+
+      - name: Package Windows release asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "dist/nulconnect-helper-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force $package | Out-Null
+          $files = @(Get-ChildItem target/release -File | Where-Object {
+            $_.Name -match '^(lib)?nulconnect[-_]helper([-_]service)?\.(exe|lib)$'
+          })
+          if (-not ($files | Where-Object { $_.Extension -eq '.exe' })) {
+            throw "No Windows helper executable found in target/release"
+          }
+          if (-not ($files | Where-Object { $_.Extension -eq '.lib' })) {
+            throw "No Windows helper library found in target/release"
+          }
+          Copy-Item $files.FullName $package
+          Compress-Archive -Path $package -DestinationPath "nulconnect-helper-${{ matrix.name }}.zip"
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulconnect-helper-${{ matrix.name }}
+          path: |
+            nulconnect-helper-${{ matrix.name }}.tar.gz
+            nulconnect-helper-${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          pattern: nulconnect-helper-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: release-assets/*

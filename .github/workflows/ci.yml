@@ -1,0 +1,146 @@
+name: Helper CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: helper-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBREATRUST_REPOSITORY: https://github.com/jsjtsty/libreatrust.git
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out helper
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Fetch latest libreatrust release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(git ls-remote --tags --refs "$LIBREATRUST_REPOSITORY" 'v*' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
+          test -n "$ref"
+          echo "Using libreatrust $ref"
+          git clone --depth 1 --branch "$ref" "$LIBREATRUST_REPOSITORY" ../libreatrust
+
+      - name: Update libreatrust dependency
+        run: cargo update -p reatrust
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nulconnect-helper-checks
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --lib --bin nulconnect-helper --locked -- -D warnings
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+          - name: macos-x86_64
+            os: macos-15-intel
+          - name: windows-x86_64
+            os: windows-latest
+          - name: windows-arm64
+            os: windows-11-arm
+
+    steps:
+      - name: Check out helper
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch latest libreatrust release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(git ls-remote --tags --refs "$LIBREATRUST_REPOSITORY" 'v*' | awk -F/ '{print $3}' | sort -V | tail -n 1)"
+          test -n "$ref"
+          echo "Using libreatrust $ref"
+          git clone --depth 1 --branch "$ref" "$LIBREATRUST_REPOSITORY" ../libreatrust
+
+      - name: Update libreatrust dependency
+        run: cargo update -p reatrust
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nulconnect-helper-build-${{ matrix.name }}
+
+      - name: Build macOS helper
+        if: runner.os == 'macOS'
+        run: cargo build --release --locked --lib --bin nulconnect-helper
+
+      - name: Build Windows helper and service
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --lib --bins --features windows-service
+
+      - name: Package macOS CI artifact
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="dist/nulconnect-helper-${{ matrix.name }}"
+          mkdir -p "$package"
+          cp target/release/nulconnect-helper "$package/"
+          cp target/release/libnulconnect_helper.a "$package/"
+          tar -C dist -czf "nulconnect-helper-${{ matrix.name }}.tar.gz" "nulconnect-helper-${{ matrix.name }}"
+
+      - name: Package Windows CI artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "dist/nulconnect-helper-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force $package | Out-Null
+          $files = @(Get-ChildItem target/release -File | Where-Object {
+            $_.Name -match '^(lib)?nulconnect[-_]helper([-_]service)?\.(exe|lib)$'
+          })
+          if (-not ($files | Where-Object { $_.Extension -eq '.exe' })) {
+            throw "No Windows helper executable found in target/release"
+          }
+          if (-not ($files | Where-Object { $_.Extension -eq '.lib' })) {
+            throw "No Windows helper library found in target/release"
+          }
+          Copy-Item $files.FullName $package
+          Compress-Archive -Path $package -DestinationPath "nulconnect-helper-${{ matrix.name }}.zip"
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: nulconnect-helper-ci-${{ matrix.name }}
+          path: |
+            nulconnect-helper-${{ matrix.name }}.tar.gz
+            nulconnect-helper-${{ matrix.name }}.zip
+          if-no-files-found: error
