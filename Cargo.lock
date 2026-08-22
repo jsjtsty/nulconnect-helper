@@ -689,7 +689,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libreatrust-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64",
  "hex",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "nulconnect-helper"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64",
  "libc",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "reatrust"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "libreatrust-core",
 ]
