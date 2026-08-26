@@ -17,13 +17,19 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SOCKET_BUFFER: usize = 256 * 1024;
 const MAX_UDP_FLOWS: usize = 512;
+/// Bounded capacity for channels between flow threads and the stack loop, so
+/// a stalled peer cannot grow an in-memory queue without limit.
+const FLOW_CHANNEL_CAPACITY: usize = 8;
+/// UDP flows without traffic in either direction for this long are reaped,
+/// so one-shot senders cannot exhaust the flow table permanently.
+const UDP_FLOW_IDLE_TIMEOUT_MS: u64 = 60_000;
 
 pub(crate) struct TunProtocolStack {
     input: Sender<Vec<u8>>,
@@ -198,6 +204,9 @@ struct TcpFlow {
     remote_tx: Option<Sender<Vec<u8>>>,
     remote_write_rx: Option<Receiver<Vec<u8>>>,
     connect_rx: Option<Receiver<AtrResult<Arc<TcpTunnel>>>>,
+    /// Upload chunks queued for the writer thread; gates how much the stack
+    /// loop drains from the app-facing socket.
+    upload_pending: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
 }
 
@@ -208,6 +217,8 @@ struct UdpFlow {
     remote_rx: Receiver<Vec<u8>>,
     connect_rx: Option<Receiver<AtrResult<Arc<UdpTunnel>>>>,
     pending: VecDeque<Vec<u8>>,
+    /// Epoch milliseconds of the last datagram in either direction.
+    last_activity: u64,
     closed: Arc<AtomicBool>,
 }
 
@@ -253,6 +264,7 @@ fn run_transport_stack(
     let mut udp_listeners = HashMap::<(Ipv4Addr, u16), SocketHandle>::new();
     let mut udp_flows = HashMap::<(SocketHandle, Ipv4Addr, u16), UdpFlow>::new();
     let mut managed_ports = HashSet::<(u8, Ipv4Addr, u16)>::new();
+    let mut tcp_recv_buffer = vec![0u8; 64 * 1024];
 
     while !close.load(Ordering::SeqCst) {
         let mut received = false;
@@ -296,6 +308,7 @@ fn run_transport_stack(
             &mut sockets,
             &mut tcp_listeners,
             &mut tcp_flows,
+            &mut tcp_recv_buffer,
             &close,
             &upload_bytes,
             &download_bytes,
@@ -404,6 +417,7 @@ fn process_tcp(
     sockets: &mut SocketSet<'static>,
     listeners: &mut HashMap<(Ipv4Addr, u16), SocketHandle>,
     flows: &mut HashMap<SocketHandle, TcpFlow>,
+    recv_buffer: &mut [u8],
     close: &Arc<AtomicBool>,
     upload_bytes: &Arc<AtomicU64>,
     download_bytes: &Arc<AtomicU64>,
@@ -445,7 +459,7 @@ fn process_tcp(
                     let _ = connect_tx.send(result);
                 });
                 let (remote_tx, remote_write_rx) = mpsc::channel();
-                let (_remote_incoming_tx, remote_rx) = mpsc::channel();
+                let (_remote_incoming_tx, remote_rx) = mpsc::sync_channel(FLOW_CHANNEL_CAPACITY);
                 let closed = Arc::new(AtomicBool::new(false));
                 flows.insert(
                     handle,
@@ -455,6 +469,7 @@ fn process_tcp(
                         remote_tx: Some(remote_tx),
                         remote_write_rx: Some(remote_write_rx),
                         connect_rx: Some(connect_rx),
+                        upload_pending: Arc::new(AtomicUsize::new(0)),
                         closed,
                     },
                 );
@@ -470,7 +485,7 @@ fn process_tcp(
                 Ok(Ok(remote)) => {
                     let reader_remote = remote.clone();
                     let reader_closed = flow.closed.clone();
-                    let (incoming_tx, incoming_rx) = mpsc::channel();
+                    let (incoming_tx, incoming_rx) = mpsc::sync_channel(FLOW_CHANNEL_CAPACITY);
                     flow.remote_rx = incoming_rx;
                     thread::spawn(move || {
                         let mut buf = vec![0u8; 64 * 1024];
@@ -489,6 +504,7 @@ fn process_tcp(
                     if let Some(write_rx) = flow.remote_write_rx.take() {
                         let writer_remote = remote.clone();
                         let writer_closed = flow.closed.clone();
+                        let writer_pending = flow.upload_pending.clone();
                         thread::spawn(move || {
                             while !writer_closed.load(Ordering::SeqCst) {
                                 match write_rx.recv_timeout(Duration::from_millis(100)) {
@@ -496,6 +512,7 @@ fn process_tcp(
                                         if writer_remote.write(&data).is_err() {
                                             break;
                                         }
+                                        writer_pending.fetch_sub(1, Ordering::Relaxed);
                                     }
                                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -516,17 +533,23 @@ fn process_tcp(
         }
         if let Some(remote) = &flow.remote {
             let socket = sockets.get_mut::<tcp::Socket>(handle);
-            let mut buf = vec![0u8; 64 * 1024];
-            if let Ok(n) = socket.recv_slice(&mut buf)
+            // The writer thread paces itself on the tunnel socket, so stop
+            // draining the app-facing socket once too much upload data is
+            // queued: the TCP window closes instead of buffering here.
+            if flow.upload_pending.load(Ordering::Relaxed) < FLOW_CHANNEL_CAPACITY
+                && let Some(tx) = &flow.remote_tx
+                && let Ok(n) = socket.recv_slice(recv_buffer)
                 && n > 0
             {
-                // remote_tx is consumed by the writer thread once the
-                // remote tunnel is established.  If it is absent the
-                // flow is being closed and the bytes are discarded.
-                if let Some(tx) = &flow.remote_tx {
-                    let _ = tx.send(buf[..n].to_vec());
+                flow.upload_pending.fetch_add(1, Ordering::Relaxed);
+                if tx.send(recv_buffer[..n].to_vec()).is_ok() {
+                    upload_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                } else {
+                    // The writer thread is gone; the upload direction is dead.
+                    flow.upload_pending.fetch_sub(1, Ordering::Relaxed);
+                    flow.remote_tx = None;
+                    flow.closed.store(true, Ordering::SeqCst);
                 }
-                upload_bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
             while let Ok(data) = flow.remote_rx.try_recv() {
                 if socket.can_send() {
@@ -572,7 +595,7 @@ fn process_udp(
     upload_bytes: &Arc<AtomicU64>,
     download_bytes: &Arc<AtomicU64>,
 ) {
-    for (&(target, target_port), &handle) in listeners.clone().iter() {
+    for (&(target, target_port), &handle) in listeners.iter() {
         let socket = sockets.get_mut::<udp::Socket>(handle);
         let mut datagrams = Vec::new();
         while let Ok((data, meta)) = socket.recv() {
@@ -598,7 +621,7 @@ fn process_udp(
                     };
                     let _ = connect_tx.send(result);
                 });
-                let (_tx, rx) = mpsc::channel();
+                let (_tx, rx) = mpsc::sync_channel(FLOW_CHANNEL_CAPACITY);
                 let closed = Arc::new(AtomicBool::new(false));
                 flows.insert(
                     key,
@@ -609,11 +632,13 @@ fn process_udp(
                         remote_rx: rx,
                         connect_rx: Some(connect_rx),
                         pending: VecDeque::new(),
+                        last_activity: now_millis(),
                         closed,
                     },
                 );
             }
             if let Some(flow) = flows.get_mut(&key) {
+                flow.last_activity = now_millis();
                 if let Some(remote) = &flow.remote {
                     if remote.write(&data).is_ok() {
                         upload_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -635,7 +660,8 @@ fn process_udp(
                         Ok(Ok(remote)) => {
                             let reader_remote = remote.clone();
                             let reader_closed = flow.closed.clone();
-                            let (incoming_tx, incoming_rx) = mpsc::channel();
+                            let (incoming_tx, incoming_rx) =
+                                mpsc::sync_channel(FLOW_CHANNEL_CAPACITY);
                             flow.remote_rx = incoming_rx;
                             thread::spawn(move || {
                                 let mut buf = vec![0u8; 65_535];
@@ -669,6 +695,7 @@ fn process_udp(
                     }
                 }
                 while let Ok(data) = flow.remote_rx.try_recv() {
+                    flow.last_activity = now_millis();
                     let _ = socket.send_slice(
                         &data,
                         IpEndpoint::new(
@@ -683,6 +710,24 @@ fn process_udp(
                     );
                     download_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                 }
+            }
+        }
+    }
+    // Reap closed and idle flows so the table stays below MAX_UDP_FLOWS and
+    // memory does not accumulate for finished one-shot senders.
+    let now = now_millis();
+    let dead: Vec<_> = flows
+        .iter()
+        .filter(|(_, flow)| {
+            udp_flow_expired(flow.closed.load(Ordering::SeqCst), flow.last_activity, now)
+        })
+        .map(|(key, _)| *key)
+        .collect();
+    for key in dead {
+        if let Some(flow) = flows.remove(&key) {
+            flow.closed.store(true, Ordering::SeqCst);
+            if let Some(remote) = flow.remote {
+                let _ = remote.close();
             }
         }
     }
@@ -712,16 +757,22 @@ fn ipv4_protocol_and_port(packet: &[u8]) -> Option<(u8, Ipv4Addr, u16)> {
     ))
 }
 
-fn _now_millis() -> u64 {
+fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
+fn udp_flow_expired(closed: bool, last_activity: u64, now: u64) -> bool {
+    closed || now.saturating_sub(last_activity) >= UDP_FLOW_IDLE_TIMEOUT_MS
+}
+
 #[cfg(test)]
 mod tests {
+    use super::UDP_FLOW_IDLE_TIMEOUT_MS;
     use super::ipv4_protocol_and_port;
+    use super::udp_flow_expired;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -746,5 +797,26 @@ mod tests {
             ipv4_protocol_and_port(&packet),
             Some((6, Ipv4Addr::new(0, 0, 0, 0), 0))
         );
+    }
+
+    #[test]
+    fn udp_flow_expires_only_after_idle_timeout() {
+        let now = 1_000_000u64;
+        assert!(!udp_flow_expired(
+            false,
+            now - UDP_FLOW_IDLE_TIMEOUT_MS + 1,
+            now
+        ));
+        assert!(udp_flow_expired(false, now - UDP_FLOW_IDLE_TIMEOUT_MS, now));
+        assert!(udp_flow_expired(false, 0, now));
+    }
+
+    #[test]
+    fn udp_flow_expiry_handles_closed_and_clock_rollback() {
+        let now = 1_000_000u64;
+        assert!(!udp_flow_expired(false, now, now));
+        assert!(udp_flow_expired(true, now, now));
+        // A wall-clock rollback must not expire an active flow.
+        assert!(!udp_flow_expired(false, now + 60_000, now));
     }
 }

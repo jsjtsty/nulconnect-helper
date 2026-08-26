@@ -1151,14 +1151,18 @@ fn wait_for_tun_setup(config: &HelperConfig) -> AtrResult<()> {
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Routes installed during setup stay installed, so each CIDR only pays
+    // for a /sbin/route probe until it first reports ready.
+    let mut pending_routes: Vec<&str> = config
+        .managed_route_cidrs
+        .iter()
+        .map(String::as_str)
+        .collect();
     while std::time::Instant::now() < deadline {
-        let route_ready = config
-            .managed_route_cidrs
-            .iter()
-            .all(|cidr| tun_route_ready_for_cidr(cidr));
+        pending_routes.retain(|cidr| !tun_route_ready_for_cidr(cidr));
         let dns_ready = scoped_dns_ready(&config.managed_domains, &config.dns_addr);
 
-        if route_ready && dns_ready {
+        if pending_routes.is_empty() && dns_ready {
             helper_log!("[NulConnect][Helper][Tun] setup ready: route=true dns=true");
             return Ok(());
         }
