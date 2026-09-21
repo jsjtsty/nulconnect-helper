@@ -353,10 +353,15 @@ fn ensure_tcp_listener(
     if listeners.contains_key(&(target, port)) {
         return;
     }
-    let socket = tcp::Socket::new(
+    let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER]),
         tcp::SocketBuffer::new(vec![0; SOCKET_BUFFER]),
     );
+    // Interactive TCP flows (ssh/tmux keystrokes, etc.) are small and latency
+    // sensitive. smoltcp's Nagle algorithm combined with the peer's delayed
+    // ACKs can stall single-keystroke segments for tens to hundreds of
+    // milliseconds, so disable it for this locally-terminated socket.
+    socket.set_nagle_enabled(false);
     let handle = sockets.add(socket);
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     if socket
