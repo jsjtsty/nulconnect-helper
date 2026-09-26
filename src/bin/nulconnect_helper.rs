@@ -1,12 +1,6 @@
 #[cfg(windows)]
-mod windows_service;
-
-#[cfg(windows)]
 fn main() {
-    if let Err(error) = windows_service::run() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
+    std::process::exit(nulconnect_helper::platform::windows_service_host::cli_main());
 }
 
 #[cfg(target_os = "macos")]

@@ -1,37 +1,81 @@
 //! Windows Wintun platform binding.
 //!
 //! Wintun is deliberately loaded at runtime. The signed `wintun.dll` is an
-//! application deployment artifact, while this module owns the ABI boundary
-//! and adapter/session lifetimes.
+//! application deployment artifact that must sit next to the helper
+//! executable; this module owns the ABI boundary and adapter/session
+//! lifetimes.
 
+use crate::platform::windows_log::executable_dir;
+use crate::platform::windows_net;
 use libloading::Library;
 use std::ffi::c_void;
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
+use windows_sys::core::GUID;
 
 type AdapterHandle = *mut c_void;
 type SessionHandle = *mut c_void;
 
 type CreateAdapter =
-    unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> AdapterHandle;
+    unsafe extern "system" fn(*const u16, *const u16, *const GUID) -> AdapterHandle;
 type OpenAdapter = unsafe extern "system" fn(*const u16) -> AdapterHandle;
 type CloseAdapter = unsafe extern "system" fn(AdapterHandle);
+type GetAdapterLuid = unsafe extern "system" fn(AdapterHandle, *mut u64);
 type StartSession = unsafe extern "system" fn(AdapterHandle, u32) -> SessionHandle;
 type EndSession = unsafe extern "system" fn(SessionHandle);
-type GetReadWaitEvent = unsafe extern "system" fn(SessionHandle) -> isize;
+type GetReadWaitEvent = unsafe extern "system" fn(SessionHandle) -> *mut c_void;
 type ReceivePacket = unsafe extern "system" fn(SessionHandle, *mut u32) -> *mut u8;
 type ReleaseReceivePacket = unsafe extern "system" fn(SessionHandle, *mut u8);
 type AllocateSendPacket = unsafe extern "system" fn(SessionHandle, u32) -> *mut u8;
 type SendPacket = unsafe extern "system" fn(SessionHandle, *mut u8);
 
+/// A stable adapter GUID keeps Windows from creating a new network profile
+/// ("NulConnect 2", "NulConnect 3", ...) every time the tunnel starts.
+const ADAPTER_GUID: GUID = GUID {
+    data1: 0x6e75_6c43,
+    data2: 0x6f6e,
+    data3: 0x4e43,
+    data4: [0x9a, 0x51, 0x4e, 0x75, 0x6c, 0x54, 0x75, 0x6e],
+};
+
+const ERROR_NO_MORE_ITEMS: i32 = 259;
+const RING_CAPACITY: u32 = 0x40_0000;
+const READ_WAIT_MS: u32 = 100;
+
+/// LUID of the adapter owned by the running engine, or 0. The IPC runtime
+/// reads it after the engine has started to install routes on the tunnel.
+static ACTIVE_ADAPTER_LUID: AtomicU64 = AtomicU64::new(0);
+
+pub fn active_adapter_luid() -> Option<u64> {
+    match ACTIVE_ADAPTER_LUID.load(Ordering::SeqCst) {
+        0 => None,
+        luid => Some(luid),
+    }
+}
+
+static ACTIVE_ADAPTER_IP: AtomicU32 = AtomicU32::new(0);
+
+pub fn active_adapter_ip() -> Option<Ipv4Addr> {
+    match ACTIVE_ADAPTER_IP.load(Ordering::SeqCst) {
+        0 => None,
+        ip => Some(Ipv4Addr::from(ip)),
+    }
+}
+
+pub fn wintun_path() -> PathBuf {
+    executable_dir().join("wintun.dll")
+}
+
 pub struct WintunApi {
     _library: Library,
-    pub path: PathBuf,
     create_adapter: CreateAdapter,
     open_adapter: OpenAdapter,
     close_adapter: CloseAdapter,
+    get_adapter_luid: GetAdapterLuid,
     start_session: StartSession,
     end_session: EndSession,
     get_read_wait_event: GetReadWaitEvent,
@@ -45,10 +89,10 @@ unsafe impl Send for WintunApi {}
 unsafe impl Sync for WintunApi {}
 
 impl WintunApi {
-    pub fn load(path: Option<&Path>) -> Result<Arc<Self>, String> {
-        let path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("wintun.dll"));
+    pub fn load() -> Result<Arc<Self>, String> {
+        // Load by absolute path so the DLL search order can never pick up a
+        // planted wintun.dll from the working directory or PATH.
+        let path = wintun_path();
         let library = unsafe { Library::new(&path) }
             .map_err(|error| format!("failed to load Wintun from {}: {error}", path.display()))?;
 
@@ -58,7 +102,7 @@ impl WintunApi {
                 .map_err(|error| {
                     format!(
                         "Wintun entry point {} is missing: {error}",
-                        String::from_utf8_lossy(name)
+                        String::from_utf8_lossy(&name[..name.len() - 1])
                     )
                 })
         }
@@ -67,6 +111,7 @@ impl WintunApi {
             create_adapter: unsafe { symbol(&library, b"WintunCreateAdapter\0")? },
             open_adapter: unsafe { symbol(&library, b"WintunOpenAdapter\0")? },
             close_adapter: unsafe { symbol(&library, b"WintunCloseAdapter\0")? },
+            get_adapter_luid: unsafe { symbol(&library, b"WintunGetAdapterLUID\0")? },
             start_session: unsafe { symbol(&library, b"WintunStartSession\0")? },
             end_session: unsafe { symbol(&library, b"WintunEndSession\0")? },
             get_read_wait_event: unsafe { symbol(&library, b"WintunGetReadWaitEvent\0")? },
@@ -75,48 +120,31 @@ impl WintunApi {
             allocate_send_packet: unsafe { symbol(&library, b"WintunAllocateSendPacket\0")? },
             send_packet: unsafe { symbol(&library, b"WintunSendPacket\0")? },
             _library: library,
-            path,
         };
         Ok(Arc::new(api))
     }
 
-    pub fn create_adapter(self: &Arc<Self>, name: &str) -> Result<WintunAdapter, String> {
-        let name = wide(name);
+    /// Reuses an adapter left behind by a crashed run, otherwise creates one.
+    pub fn open_or_create_adapter(self: &Arc<Self>, name: &str) -> Result<WintunAdapter, String> {
+        let wide_name = wide(name);
+        let handle = unsafe { (self.open_adapter)(wide_name.as_ptr()) };
+        if !handle.is_null() {
+            crate::helper_log!("[Wintun] reusing existing adapter {name}");
+            return Ok(WintunAdapter {
+                api: Arc::clone(self),
+                handle,
+            });
+        }
         let kind = wide("NulConnect");
         let handle =
-            unsafe { (self.create_adapter)(name.as_ptr(), kind.as_ptr(), std::ptr::null()) };
-        if handle.is_null() {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(183) {
-                let handle = unsafe { (self.open_adapter)(name.as_ptr()) };
-                if !handle.is_null() {
-                    return Ok(WintunAdapter {
-                        api: Arc::clone(self),
-                        handle,
-                    });
-                }
-                return Err(format!(
-                    "WintunOpenAdapter failed: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-            return Err(format!("WintunCreateAdapter failed: {error}"));
-        }
-        Ok(WintunAdapter {
-            api: Arc::clone(self),
-            handle,
-        })
-    }
-
-    pub fn open_adapter(self: &Arc<Self>, name: &str) -> Result<WintunAdapter, String> {
-        let name = wide(name);
-        let handle = unsafe { (self.open_adapter)(name.as_ptr()) };
+            unsafe { (self.create_adapter)(wide_name.as_ptr(), kind.as_ptr(), &ADAPTER_GUID) };
         if handle.is_null() {
             return Err(format!(
-                "WintunOpenAdapter failed: {}",
+                "WintunCreateAdapter failed: {}",
                 std::io::Error::last_os_error()
             ));
         }
+        crate::helper_log!("[Wintun] created adapter {name}");
         Ok(WintunAdapter {
             api: Arc::clone(self),
             handle,
@@ -130,8 +158,15 @@ pub struct WintunAdapter {
 }
 
 unsafe impl Send for WintunAdapter {}
+unsafe impl Sync for WintunAdapter {}
 
 impl WintunAdapter {
+    pub fn luid(&self) -> u64 {
+        let mut luid = 0u64;
+        unsafe { (self.api.get_adapter_luid)(self.handle, &mut luid) };
+        luid
+    }
+
     pub fn start_session(self: &Arc<Self>, capacity: u32) -> Result<WintunSession, String> {
         let handle = unsafe { (self.api.start_session)(self.handle, capacity) };
         if handle.is_null() {
@@ -164,33 +199,46 @@ unsafe impl Send for WintunSession {}
 unsafe impl Sync for WintunSession {}
 
 impl WintunSession {
-    pub fn read_wait_event(&self) -> isize {
+    fn read_wait_event(&self) -> *mut c_void {
         unsafe { (self.adapter.api.get_read_wait_event)(self.handle) }
     }
 
-    pub fn receive(&self) -> Result<Option<Vec<u8>>, String> {
+    /// Copies the next packet into `buffer`. `Ok(None)` means the ring is
+    /// currently empty.
+    fn receive_into(&self, buffer: &mut [u8]) -> std::io::Result<Option<usize>> {
         let mut size = 0u32;
         let packet = unsafe { (self.adapter.api.receive_packet)(self.handle, &mut size) };
         if packet.is_null() {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(259) {
+            if error.raw_os_error() == Some(ERROR_NO_MORE_ITEMS) {
                 return Ok(None);
             }
-            return Err(format!("WintunReceivePacket failed: {error}"));
+            return Err(std::io::Error::other(format!(
+                "WintunReceivePacket failed: {error}"
+            )));
         }
-        let data = unsafe { std::slice::from_raw_parts(packet, size as usize).to_vec() };
+        let size = size as usize;
+        let result = if size > buffer.len() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Wintun packet exceeds buffer",
+            ))
+        } else {
+            unsafe { std::ptr::copy_nonoverlapping(packet, buffer.as_mut_ptr(), size) };
+            Ok(Some(size))
+        };
         unsafe { (self.adapter.api.release_receive_packet)(self.handle, packet) };
-        Ok(Some(data))
+        result
     }
 
-    pub fn send(&self, packet: &[u8]) -> Result<(), String> {
+    fn send(&self, packet: &[u8]) -> std::io::Result<()> {
         let buffer =
             unsafe { (self.adapter.api.allocate_send_packet)(self.handle, packet.len() as u32) };
         if buffer.is_null() {
-            return Err(format!(
+            return Err(std::io::Error::other(format!(
                 "WintunAllocateSendPacket failed: {}",
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), buffer, packet.len()) };
         unsafe { (self.adapter.api.send_packet)(self.handle, buffer) };
@@ -207,130 +255,70 @@ impl Drop for WintunSession {
 }
 
 pub struct WintunTunDevice {
+    // Field order matters: the session must end before the adapter closes.
     session: WintunSession,
-    adapter_name: String,
+    adapter: Arc<WintunAdapter>,
+    read_event: usize,
+    luid: u64,
     local_ip: Ipv4Addr,
 }
 
 impl WintunTunDevice {
-    pub fn open(
-        dll_path: Option<&Path>,
-        adapter_name: &str,
-        local_ip: Ipv4Addr,
-    ) -> Result<Self, String> {
-        let api = WintunApi::load(dll_path)?;
-        let adapter = Arc::new(api.create_adapter(adapter_name)?);
-        let session = adapter.start_session(0x400000)?;
-        configure_adapter_ipv4(adapter_name, local_ip)?;
+    pub fn open(adapter_name: &str, local_ip: Ipv4Addr, mtu: u16) -> Result<Self, String> {
+        let api = WintunApi::load()?;
+        let adapter = Arc::new(api.open_or_create_adapter(adapter_name)?);
+        let luid = adapter.luid();
+        windows_net::configure_tunnel_interface(luid, local_ip, mtu)?;
+        let session = adapter.start_session(RING_CAPACITY)?;
+        let read_event = session.read_wait_event() as usize;
+        ACTIVE_ADAPTER_LUID.store(luid, Ordering::SeqCst);
+        ACTIVE_ADAPTER_IP.store(u32::from(local_ip), Ordering::SeqCst);
+        crate::helper_log!("[Wintun] session started luid={luid:#x} local_ip={local_ip} mtu={mtu}");
         Ok(Self {
             session,
-            adapter_name: adapter_name.to_string(),
+            adapter,
+            read_event,
+            luid,
             local_ip,
         })
     }
 
+    /// Returns `Ok(0)` when nothing arrived within the wait window so the
+    /// caller can re-check its shutdown flag without spinning.
     pub fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self.session.receive() {
-            Ok(Some(packet)) => {
-                if packet.len() > buffer.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Wintun packet exceeds buffer",
-                    ));
-                }
-                buffer[..packet.len()].copy_from_slice(&packet);
-                Ok(packet.len())
-            }
-            Ok(None) => Err(std::io::ErrorKind::WouldBlock.into()),
-            Err(error) => Err(std::io::Error::other(error)),
+        if let Some(size) = self.session.receive_into(buffer)? {
+            return Ok(size);
         }
+        match unsafe { WaitForSingleObject(self.read_event as *mut c_void, READ_WAIT_MS) } {
+            WAIT_OBJECT_0 | WAIT_TIMEOUT => {}
+            _ => return Err(std::io::Error::last_os_error()),
+        }
+        Ok(self.session.receive_into(buffer)?.unwrap_or(0))
     }
 
     pub fn send_packet(&self, packet: &[u8]) -> std::io::Result<()> {
-        self.session.send(packet).map_err(std::io::Error::other)
+        self.session.send(packet)
     }
 }
 
 impl Drop for WintunTunDevice {
     fn drop(&mut self) {
-        let _ = remove_adapter_ipv4(&self.adapter_name, self.local_ip);
+        let _ =
+            ACTIVE_ADAPTER_LUID.compare_exchange(self.luid, 0, Ordering::SeqCst, Ordering::SeqCst);
+        let _ = ACTIVE_ADAPTER_IP.compare_exchange(
+            u32::from(self.local_ip),
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        // A reused adapter survives CloseAdapter, so drop its address
+        // explicitly; a freshly created adapter is removed entirely.
+        windows_net::remove_interface_address(self.luid, self.local_ip);
+        let _ = &self.adapter;
+        crate::helper_log!("[Wintun] session closed luid={:#x}", self.luid);
     }
 }
 
-fn configure_adapter_ipv4(adapter_name: &str, local_ip: Ipv4Addr) -> Result<(), String> {
-    let output = Command::new("netsh")
-        .args(["interface", "ipv4", "set", "address"])
-        .arg(format!("name={adapter_name}"))
-        .args([
-            "static",
-            &local_ip.to_string(),
-            "255.255.255.255",
-            "none",
-            "store=active",
-        ])
-        .output()
-        .map_err(|error| format!("failed to run netsh for Wintun address: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "netsh failed to configure Wintun address: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-fn remove_adapter_ipv4(adapter_name: &str, local_ip: Ipv4Addr) -> Result<(), String> {
-    let output = Command::new("netsh")
-        .args(["interface", "ipv4", "delete", "address"])
-        .arg(format!("name={adapter_name}"))
-        .arg(format!("addr={local_ip}"))
-        .output()
-        .map_err(|error| format!("failed to remove Wintun address: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "netsh failed to remove Wintun address: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-pub struct WintunRuntime {
-    adapter: Option<Arc<WintunAdapter>>,
-    session: Option<WintunSession>,
-    adapter_name: Option<String>,
-}
-
-impl WintunRuntime {
-    pub fn start(&mut self, dll_path: Option<&Path>, adapter_name: &str) -> Result<(), String> {
-        if self.session.is_some() {
-            return Err("Wintun session is already running".into());
-        }
-        let api = WintunApi::load(dll_path)?;
-        let adapter = Arc::new(api.create_adapter(adapter_name)?);
-        let session = adapter.start_session(0x400000)?;
-        self.adapter = Some(adapter);
-        self.session = Some(session);
-        self.adapter_name = Some(adapter_name.to_string());
-        Ok(())
-    }
-
-    pub fn stop(&mut self) {
-        self.session = None;
-        self.adapter = None;
-        self.adapter_name = None;
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.session.is_some()
-    }
-
-    pub fn adapter_name(&self) -> Option<&str> {
-        self.adapter_name.as_deref()
-    }
-}
-
-fn wide(value: &str) -> Vec<u16> {
+pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }

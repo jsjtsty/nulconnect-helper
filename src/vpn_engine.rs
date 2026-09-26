@@ -306,9 +306,9 @@ fn request_l3_virtual_ip(config: &VpnEngineConfig) -> AtrResult<Ipv4Addr> {
 #[cfg(target_os = "windows")]
 fn build_tun_device(config: &VpnEngineConfig, _local_ip: Ipv4Addr) -> AtrResult<Arc<dyn TunIo>> {
     let device = crate::platform::windows::WintunTunDevice::open(
-        None,
         config.tun_name.as_deref().unwrap_or("NulConnect"),
         _local_ip,
+        config.mtu,
     )
     .map_err(AtrError::NetworkFailed)?;
     Ok(Arc::new(device))
