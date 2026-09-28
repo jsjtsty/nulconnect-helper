@@ -121,6 +121,10 @@ enum HelperCommand {
     SetSystemProxy {
         endpoint: ProxyEndpoint,
         server_host: String,
+        /// When set, configure this PAC URL instead of fixed proxies so
+        /// only managed destinations use the local proxy.
+        #[serde(default)]
+        pac_url: Option<String>,
     },
     RestoreSystemProxy,
     Cleanup,
@@ -261,9 +265,19 @@ fn serve(
         tun_failure: Mutex::new(None),
         shutting_down: Mutex::new(false),
     });
+    recover_tun_leftovers(&runtime);
 
     loop {
-        let (stream, _addr) = listener.accept()?;
+        let stream = match listener.accept() {
+            Ok((stream, _addr)) => stream,
+            Err(err) => {
+                // Transient failures (e.g. EMFILE) must not take the helper
+                // down; launchd would restart it without the TUN state.
+                helper_log!("[NulConnect][Helper] accept failed: {err}");
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         if *runtime.shutting_down.lock().unwrap() {
             break;
         }
@@ -296,6 +310,22 @@ fn serve(
     let _ = stop_tun(&runtime);
     let _ = fs::remove_file(socket_path);
     Ok(())
+}
+
+/// A helper that exited while the VPN was up (crash, forced restart) leaves
+/// routes, `/etc/resolver` entries and changed DNS settings behind. The new
+/// process has no engine, so restore the network before accepting clients.
+fn recover_tun_leftovers(runtime: &HelperRuntime) {
+    let leftovers = [
+        managed_routes_state_path(),
+        scoped_dns_state_path(),
+        tun_network_snapshot_path(runtime),
+    ];
+    if leftovers.iter().any(|path| path.exists()) {
+        helper_log!("[NulConnect][Helper] restoring network state left by a previous run");
+        restore_tun_network_after_stop(runtime);
+        let _ = write_tun_state(runtime, "stopped", None, None);
+    }
 }
 
 fn handle_client(mut stream: UnixStream, runtime: Arc<HelperRuntime>) -> AtrResult<()> {
@@ -370,7 +400,8 @@ fn handle_request(request: HelperRequest, runtime: &Arc<HelperRuntime>) -> Helpe
         HelperCommand::SetSystemProxy {
             endpoint,
             server_host,
-        } => set_system_proxy(runtime, endpoint, &server_host),
+            pac_url,
+        } => set_system_proxy(runtime, endpoint, &server_host, pac_url.as_deref()),
         HelperCommand::RestoreSystemProxy => {
             restore_system_proxy(runtime).map(|_| json!({ "status": "restored" }))
         }
@@ -442,6 +473,7 @@ fn helper_status(runtime: &HelperRuntime) -> AtrResult<Value> {
 }
 
 fn start_tun(runtime: Arc<HelperRuntime>, config: HelperConfig) -> AtrResult<Value> {
+    validate_helper_config(&config)?;
     {
         let mut starting = runtime.tun_starting.lock().unwrap();
         if *starting {
@@ -496,6 +528,61 @@ fn start_tun(runtime: Arc<HelperRuntime>, config: HelperConfig) -> AtrResult<Val
     Ok(json!({ "status": "starting" }))
 }
 
+/// The helper runs as root and writes these values into the routing table
+/// and `/etc/resolver`; accept only well-formed input.
+fn validate_helper_config(config: &HelperConfig) -> AtrResult<()> {
+    let dns = config.dns_addr.trim();
+    if !dns.is_empty() && !is_valid_dns_server(dns) {
+        return Err(AtrError::InvalidArgument(format!(
+            "invalid DNS server address: {dns}"
+        )));
+    }
+    for cidr in &config.managed_route_cidrs {
+        if parse_ipv4_cidr(cidr).is_none() {
+            return Err(AtrError::InvalidArgument(format!(
+                "invalid managed route: {cidr}"
+            )));
+        }
+    }
+    if let Some(name) = config.tun_name.as_deref().filter(|name| !name.is_empty())
+        && !(name.starts_with("utun") && name[4..].chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Err(AtrError::InvalidArgument(format!(
+            "invalid TUN interface name: {name}"
+        )));
+    }
+    if !(576..=9000).contains(&config.mtu) {
+        return Err(AtrError::InvalidArgument(format!(
+            "invalid MTU: {}",
+            config.mtu
+        )));
+    }
+    Ok(())
+}
+
+/// An IPv4 or IPv6 address, the latter optionally with a zone
+/// (`fe80::1%en0`), as accepted by `/etc/resolver` files.
+fn is_valid_dns_server(server: &str) -> bool {
+    let (address, zone) = match server.split_once('%') {
+        Some((address, zone)) => (address, Some(zone)),
+        None => (server, None),
+    };
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => zone.is_none(),
+        Ok(std::net::IpAddr::V6(_)) => zone.is_none_or(|zone| {
+            !zone.is_empty() && zone.chars().all(|ch| ch.is_ascii_alphanumeric())
+        }),
+        Err(_) => false,
+    }
+}
+
+fn parse_ipv4_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let (addr, prefix) = cidr.trim().split_once('/')?;
+    let addr = addr.parse::<Ipv4Addr>().ok()?;
+    let prefix = prefix.parse::<u8>().ok().filter(|prefix| *prefix <= 32)?;
+    Some((addr, prefix))
+}
+
 fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<()> {
     let _operation = runtime.tun_operation.lock().unwrap();
     if runtime.tun_engine.lock().unwrap().is_some() {
@@ -524,14 +611,26 @@ fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<
         }
     };
     helper_log!("[NulConnect][Helper][Tun] worker: L3 engine created");
-    if let Err(err) = setup_managed_tun_routes(&config) {
+    let tun_name = match engine.interface_name() {
+        Some(name) => Ok(name.to_string()),
+        None => discover_tun_name(),
+    };
+    let tun_name = match tun_name {
+        Ok(name) => name,
+        Err(err) => {
+            let _ = engine.stop();
+            restore_tun_network_after_stop(runtime);
+            return Err(err);
+        }
+    };
+    if let Err(err) = setup_managed_tun_routes(&config, &tun_name) {
         helper_log!("[NulConnect][Helper][Tun] worker: route setup failed: {err}");
         let _ = engine.stop();
         restore_tun_network_after_stop(runtime);
         return Err(err);
     }
     helper_log!("[NulConnect][Helper][Tun] worker: route setup complete");
-    if let Err(err) = wait_for_tun_setup(&config) {
+    if let Err(err) = wait_for_tun_setup(&config, &tun_name) {
         helper_log!("[NulConnect][Helper][Tun] worker: setup wait failed: {err}");
         let _ = engine.stop();
         restore_tun_network_after_stop(runtime);
@@ -828,7 +927,7 @@ fn cleanup_tun_routes() {
     let _ = fs::remove_file(state_path);
 }
 
-fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
+fn setup_managed_tun_routes(config: &HelperConfig, tun_name: &str) -> AtrResult<()> {
     if !config.setup_routes {
         helper_log!("[NulConnect][Helper][Tun] managed route setup skipped");
         return Ok(());
@@ -838,7 +937,6 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
     // the connection was interrupted. Remove only routes recorded as ours
     // before calculating the new route set.
     cleanup_tun_routes();
-    let tun_name = discover_tun_name()?;
     configure_scoped_dns_resolvers(&config.managed_domains, &config.dns_addr)?;
 
     let mut routes = config.managed_route_cidrs.clone();
@@ -850,14 +948,24 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
             config.dns_addr.trim()
         );
     }
-    routes.extend(config.managed_route_cidrs.iter().cloned());
     routes.sort();
     routes.dedup();
     let node_routes = node_route_cidrs(config)?;
+    // Pinning the gateway nodes to the physical gateway only matters when a
+    // managed route covers them. Without a plain IPv4 default gateway (e.g.
+    // another VPN owns the default route) keep going without the pins.
     let default_gateway = if node_routes.is_empty() {
         None
     } else {
-        Some(default_ipv4_gateway()?)
+        match default_ipv4_gateway() {
+            Ok(gateway) => Some(gateway),
+            Err(err) => {
+                helper_log!(
+                    "[NulConnect][Helper][Tun] warning: skipping direct node routes: {err}"
+                );
+                None
+            }
+        }
     };
 
     let mut installed: Vec<String> = Vec::new();
@@ -865,7 +973,7 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
         if cidr.trim().is_empty() {
             continue;
         }
-        if let Err(err) = add_route_cidr(&cidr, "10.0.0.1") {
+        if let Err(err) = add_route_cidr(&cidr, &["-interface", tun_name]) {
             for route in installed {
                 delete_route_cidr(&route);
             }
@@ -875,7 +983,7 @@ fn setup_managed_tun_routes(config: &HelperConfig) -> AtrResult<()> {
     }
     if let Some(gateway) = default_gateway {
         for cidr in node_routes {
-            if let Err(err) = add_route_cidr(&cidr, &gateway) {
+            if let Err(err) = add_route_cidr(&cidr, &[gateway.as_str()]) {
                 helper_log!(
                     "[NulConnect][Helper][Tun] warning: failed to add direct node route {} via {}: {}",
                     cidr,
@@ -905,8 +1013,10 @@ fn should_route_dns_via_tun(server: &str) -> bool {
     if server.is_empty() {
         return false;
     }
+    // The TUN carries IPv4 only; an IPv6 resolver stays on the physical
+    // interface.
     let Ok(server_ip) = server.parse::<Ipv4Addr>() else {
-        return true;
+        return false;
     };
 
     // When the configured resolver is the LAN's default gateway, it is a
@@ -1015,15 +1125,28 @@ fn configure_scoped_dns_resolvers(domains: &[String], server: &str) -> AtrResult
     let resolver_dir = Path::new("/etc/resolver");
     fs::create_dir_all(resolver_dir)?;
 
+    let contents = format!("nameserver {}\n", server.trim());
     let mut installed = Vec::new();
     for domain in normalized_resolver_domains(domains) {
         let path = resolver_dir.join(&domain);
+        // Our own files were removed above; anything still there belongs to
+        // the user or another VPN and must survive connect/disconnect. A
+        // file identical to ours is a leftover from an interrupted run.
+        if let Ok(existing) = fs::read_to_string(&path)
+            && existing != contents
+        {
+            helper_log!(
+                "[NulConnect][Helper][Tun] keeping existing resolver {}",
+                path.display()
+            );
+            continue;
+        }
         helper_log!(
             "[NulConnect][Helper][Tun] set scoped DNS resolver {} -> {}",
             path.display(),
             server
         );
-        fs::write(&path, format!("nameserver {server}\n"))?;
+        fs::write(&path, &contents)?;
         installed.push(domain);
     }
 
@@ -1069,9 +1192,9 @@ fn normalized_resolver_domains(domains: &[String]) -> Vec<String> {
             normalized = stripped.to_string();
         }
         if normalized.is_empty()
-            || normalized.contains('/')
-            || normalized.contains(':')
-            || normalized.contains('*')
+            || !normalized
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
             || normalized == "local"
         {
             continue;
@@ -1083,16 +1206,17 @@ fn normalized_resolver_domains(domains: &[String]) -> Vec<String> {
     output
 }
 
-fn add_route_cidr(cidr: &str, gateway: &str) -> AtrResult<()> {
+/// `target` is either a gateway address or `["-interface", name]`.
+fn add_route_cidr(cidr: &str, target: &[&str]) -> AtrResult<()> {
     let normalized = normalize_route_cidr(cidr)?;
     helper_log!(
         "[NulConnect][Helper][Tun] route add {} {}",
         normalized.route_args.join(" "),
-        gateway
+        target.join(" ")
     );
     let mut args = vec!["-n", "add"];
     args.extend(normalized.route_args.iter().map(String::as_str));
-    args.push(gateway);
+    args.extend_from_slice(target);
     match run_command_ok("/sbin/route", &args) {
         Ok(()) => Ok(()),
         Err(err) if err.to_string().contains("File exists") => Ok(()),
@@ -1145,7 +1269,7 @@ fn managed_routes_state_path() -> PathBuf {
     PathBuf::from(DEFAULT_STATE_DIR).join("tun-managed-routes.json")
 }
 
-fn wait_for_tun_setup(config: &HelperConfig) -> AtrResult<()> {
+fn wait_for_tun_setup(config: &HelperConfig, tun_name: &str) -> AtrResult<()> {
     if !config.setup_routes {
         return Ok(());
     }
@@ -1159,8 +1283,8 @@ fn wait_for_tun_setup(config: &HelperConfig) -> AtrResult<()> {
         .map(String::as_str)
         .collect();
     while std::time::Instant::now() < deadline {
-        pending_routes.retain(|cidr| !tun_route_ready_for_cidr(cidr));
-        let dns_ready = scoped_dns_ready(&config.managed_domains, &config.dns_addr);
+        pending_routes.retain(|cidr| !tun_route_ready_for_cidr(cidr, tun_name));
+        let dns_ready = scoped_dns_ready(&config.dns_addr);
 
         if pending_routes.is_empty() && dns_ready {
             helper_log!("[NulConnect][Helper][Tun] setup ready: route=true dns=true");
@@ -1176,17 +1300,23 @@ fn wait_for_tun_setup(config: &HelperConfig) -> AtrResult<()> {
     ))
 }
 
-fn tun_route_ready_for_cidr(cidr: &str) -> bool {
+fn tun_route_ready_for_cidr(cidr: &str, tun_name: &str) -> bool {
     let Ok(probe) = route_probe_address(cidr) else {
         return false;
     };
+    let expected = format!("interface: {tun_name}");
     command_text("/sbin/route", &["-n", "get", &probe])
-        .map(|text| text.contains("gateway: 10.0.0.1") || text.contains("interface: utun"))
+        .map(|text| text.lines().any(|line| line.trim() == expected))
         .unwrap_or(false)
 }
 
-fn scoped_dns_ready(domains: &[String], server: &str) -> bool {
-    let domains = normalized_resolver_domains(domains);
+/// Checks the resolver files this helper installed; domains skipped because
+/// the user already has their own resolver file are not expected.
+fn scoped_dns_ready(server: &str) -> bool {
+    let domains = fs::read_to_string(scoped_dns_state_path())
+        .ok()
+        .and_then(|data| serde_json::from_str::<Vec<String>>(&data).ok())
+        .unwrap_or_default();
     if domains.is_empty() {
         return true;
     }
@@ -1499,28 +1629,64 @@ fn set_system_proxy(
     runtime: &HelperRuntime,
     endpoint: ProxyEndpoint,
     server_host: &str,
+    pac_url: Option<&str>,
 ) -> AtrResult<Value> {
     validate_proxy_endpoint(&endpoint)?;
+    if let Some(url) = pac_url {
+        validate_pac_url(url, &endpoint)?;
+    }
     let services = list_network_services()?;
     if services.is_empty() {
         return Err(AtrError::NotFound("no network services found".into()));
     }
     let snapshot_path = system_proxy_snapshot_path(runtime);
-    let snapshot = if snapshot_path.exists() {
+    let mut snapshot = if snapshot_path.exists() {
         read_system_proxy_snapshot(&snapshot_path)?
     } else {
-        let snapshot = SystemProxySnapshot {
+        SystemProxySnapshot {
             saved_at_unix_secs: now_unix_secs(),
-            services: services
-                .iter()
-                .map(|service| make_service_snapshot(service))
-                .collect::<AtrResult<Vec<_>>>()?,
-        };
-        write_system_proxy_snapshot(&snapshot_path, &snapshot)?;
-        snapshot
+            services: Vec::new(),
+        }
     };
+    // Record the original settings of services that appeared since the
+    // snapshot (e.g. a new USB Ethernet adapter) before touching them, so
+    // they are restored too.
+    let mut snapshot_changed = !snapshot_path.exists();
+    for service in &services {
+        if !snapshot.services.iter().any(|saved| &saved.name == service) {
+            snapshot.services.push(make_service_snapshot(service)?);
+            snapshot_changed = true;
+        }
+    }
+    if snapshot_changed {
+        write_system_proxy_snapshot(&snapshot_path, &snapshot)?;
+    }
     let exceptions = merged_exceptions(server_host, &snapshot);
-    for service in &snapshot.services {
+    // Services removed since the snapshot cannot be configured.
+    let active = snapshot
+        .services
+        .iter()
+        .filter(|service| services.contains(&service.name));
+    if let Some(url) = pac_url {
+        let mut configured = 0;
+        for service in active {
+            for state in [
+                "-setwebproxystate",
+                "-setsecurewebproxystate",
+                "-setsocksfirewallproxystate",
+            ] {
+                run_networksetup(&[state, &service.name, "off"])?;
+            }
+            run_networksetup(&["-setproxyautodiscovery", &service.name, "off"])?;
+            run_networksetup(&["-setautoproxyurl", &service.name, url])?;
+            run_networksetup(&["-setautoproxystate", &service.name, "on"])?;
+            configured += 1;
+        }
+        return Ok(json!({ "services": configured, "mode": "pac" }));
+    }
+    let mut configured = 0;
+    for service in active {
+        configured += 1;
         run_networksetup(&[
             "-setwebproxy",
             &service.name,
@@ -1551,7 +1717,27 @@ fn set_system_proxy(
         args.extend(exceptions.iter().map(String::as_str));
         run_networksetup(&args)?;
     }
-    Ok(json!({ "services": snapshot.services.len() }))
+    Ok(json!({ "services": configured, "mode": "manual" }))
+}
+
+/// The PAC URL must point at the local proxy that is being configured.
+fn validate_pac_url(url: &str, endpoint: &ProxyEndpoint) -> AtrResult<()> {
+    let host = if endpoint.host.contains(':') {
+        format!("[{}]", endpoint.host)
+    } else {
+        endpoint.host.clone()
+    };
+    let prefix = format!("http://{host}:{}/proxy.pac?token=", endpoint.port);
+    let token_valid = url.strip_prefix(&prefix).is_some_and(|token| {
+        !token.is_empty() && token.chars().all(|ch| ch.is_ascii_alphanumeric())
+    });
+    if token_valid {
+        Ok(())
+    } else {
+        Err(AtrError::InvalidArgument(
+            "PAC URL must point at the local proxy".into(),
+        ))
+    }
 }
 
 fn restore_system_proxy(runtime: &HelperRuntime) -> AtrResult<()> {
@@ -1814,4 +2000,66 @@ fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ProxyEndpoint, is_valid_dns_server, normalized_resolver_domains, parse_ipv4_cidr,
+        validate_pac_url,
+    };
+
+    #[test]
+    fn dns_server_accepts_ipv4_and_scoped_ipv6_only() {
+        assert!(is_valid_dns_server("10.0.0.53"));
+        assert!(is_valid_dns_server("2001:db8::53"));
+        assert!(is_valid_dns_server("fe80::1%en0"));
+        assert!(!is_valid_dns_server("10.0.0.53%en0"));
+        assert!(!is_valid_dns_server("fe80::1%en0\nsearch evil"));
+        assert!(!is_valid_dns_server("dns.example.com"));
+    }
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn pac_url_must_target_the_local_proxy() {
+        let endpoint = ProxyEndpoint {
+            host: "127.0.0.1".into(),
+            port: 1920,
+        };
+        assert!(
+            validate_pac_url("http://127.0.0.1:1920/proxy.pac?token=abc123", &endpoint).is_ok()
+        );
+        assert!(validate_pac_url("http://127.0.0.1:1921/proxy.pac?token=abc", &endpoint).is_err());
+        assert!(validate_pac_url("http://evil.example/proxy.pac?token=abc", &endpoint).is_err());
+        assert!(validate_pac_url("http://127.0.0.1:1920/proxy.pac?token=", &endpoint).is_err());
+        assert!(
+            validate_pac_url("http://127.0.0.1:1920/proxy.pac?token=a&x=1", &endpoint).is_err()
+        );
+    }
+
+    #[test]
+    fn parses_only_well_formed_ipv4_cidrs() {
+        assert_eq!(
+            parse_ipv4_cidr("10.1.0.0/16"),
+            Some((Ipv4Addr::new(10, 1, 0, 0), 16))
+        );
+        assert_eq!(parse_ipv4_cidr("10.1.0.0/33"), None);
+        assert_eq!(parse_ipv4_cidr("-ifscope/24"), None);
+        assert_eq!(parse_ipv4_cidr("10.1.0.0"), None);
+    }
+
+    #[test]
+    fn resolver_domains_reject_unsafe_names() {
+        let domains = [
+            "*.Example.EDU.".to_string(),
+            "../etc/passwd".to_string(),
+            "evil\nnameserver 1.1.1.1".to_string(),
+            "local".to_string(),
+            "intra_net.example".to_string(),
+        ];
+        assert_eq!(
+            normalized_resolver_domains(&domains),
+            vec!["example.edu".to_string(), "intra_net.example".to_string()]
+        );
+    }
 }

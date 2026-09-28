@@ -87,6 +87,10 @@ pub struct VpnEngine {
 pub(crate) trait TunIo: Send + Sync {
     fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize>;
     fn send_packet(&self, packet: &[u8]) -> std::io::Result<()>;
+    /// The OS interface name (e.g. `utun5`), when the platform exposes one.
+    fn interface_name(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -104,6 +108,10 @@ impl TunIo for TunRsDevice {
     fn send_packet(&self, packet: &[u8]) -> std::io::Result<()> {
         self.device.send(packet).map(|_| ())
     }
+
+    fn interface_name(&self) -> Option<String> {
+        self.device.name().ok()
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -117,6 +125,7 @@ impl TunIo for crate::platform::windows::WintunTunDevice {
 }
 
 struct VpnEngineImpl {
+    interface_name: Option<String>,
     close: Arc<AtomicBool>,
     #[cfg(not(target_os = "windows"))]
     interrupt: Arc<InterruptEvent>,
@@ -149,6 +158,11 @@ impl VpnEngine {
         #[cfg(not(target_os = "windows"))]
         let _ = self.inner.interrupt.trigger();
         let _ = self.inner.tunnel.close();
+    }
+
+    /// Name of the TUN interface carrying the VPN (e.g. `utun5`).
+    pub fn interface_name(&self) -> Option<&str> {
+        self.inner.interface_name.as_deref()
     }
 
     pub fn status(&self) -> VpnEngineStatus {
@@ -195,6 +209,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     let device = build_tun_device(&config, local_ip)?;
     #[cfg(not(target_os = "windows"))]
     let device = build_tun_device(&config, local_ip, interrupt.clone())?;
+    let interface_name = device.interface_name();
     helper_debug_log("start: TUN device built");
     helper_debug_log("start: opening libreatrust L3 tunnel");
     let (client, tunnel) = build_l3_runtime(&config)?;
@@ -249,6 +264,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
 
     Ok(VpnEngine {
         inner: VpnEngineImpl {
+            interface_name,
             close,
             #[cfg(not(target_os = "windows"))]
             interrupt,
@@ -333,7 +349,10 @@ fn build_tun_device(
         builder = builder.name(tun_name.clone());
     }
 
-    builder = builder.ipv4(local_ip.to_string(), 32, Some("10.0.0.1".to_string()));
+    // Use the virtual IP as its own point-to-point peer (as wg-quick does).
+    // A separate fixed peer address would install a host route that can
+    // shadow a LAN gateway using the same address.
+    builder = builder.ipv4(local_ip.to_string(), 32, Some(local_ip.to_string()));
 
     #[cfg(target_os = "macos")]
     {
