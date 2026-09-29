@@ -1,6 +1,6 @@
 [package]
 name = "nulconnect-helper"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 
 [lib]
@@ -34,7 +34,6 @@ smoltcp = { version = "0.13.1", default-features = false, features = ["proto-ipv
 
 [features]
 default = []
-verbose-logs = ["reatrust/verbose-logs"]
 windows-service = []
 
 [target.'cfg(windows)'.dependencies]

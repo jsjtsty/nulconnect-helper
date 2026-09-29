@@ -24,35 +24,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const HELPER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_SOCKET_PATH: &str = "/var/run/nulconnect-helper.sock";
 const DEFAULT_STATE_DIR: &str = "/Library/Application Support/NulConnect";
-#[cfg(feature = "verbose-logs")]
-const HELPER_LOG_PATH: &str = "/Library/Application Support/NulConnect/nulconnect-helper.log";
-
-#[cfg(feature = "verbose-logs")]
+/// Writes to the shared libreatrust log (off unless the app enabled it via
+/// `set_logging`); the file is rotated at 5 MB.
 macro_rules! helper_log {
     ($($arg:tt)*) => {
-        #[cfg(feature = "verbose-logs")]
-        helper_log_line(format!("[{}] {}", now_unix_secs(), format_args!($($arg)*)));
+        if reatrust::verbose_logging_enabled() {
+            reatrust::log_write(&format!($($arg)*));
+        }
     };
-}
-
-#[cfg(not(feature = "verbose-logs"))]
-macro_rules! helper_log {
-    ($($arg:tt)*) => {{
-        let _ = format_args!($($arg)*);
-    }};
-}
-
-#[cfg(feature = "verbose-logs")]
-fn helper_log_line(line: String) {
-    eprintln!("{line}");
-    let _ = fs::create_dir_all(DEFAULT_STATE_DIR);
-    if let Ok(mut file) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(HELPER_LOG_PATH)
-    {
-        let _ = writeln!(file, "{line}");
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -129,6 +108,10 @@ enum HelperCommand {
     RestoreSystemProxy,
     Cleanup,
     Shutdown,
+    /// Turns diagnostic logging on or off (also for the embedded library).
+    SetLogging {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -408,6 +391,11 @@ fn handle_request(request: HelperRequest, runtime: &Arc<HelperRuntime>) -> Helpe
         HelperCommand::Cleanup => {
             let _ = stop_tun(runtime);
             restore_system_proxy(runtime).map(|_| json!({ "status": "cleaned" }))
+        }
+        HelperCommand::SetLogging { enabled } => {
+            reatrust::set_verbose_logging(enabled);
+            helper_log!("logging enabled by client");
+            Ok(json!({ "logging": enabled }))
         }
         HelperCommand::Shutdown => {
             let _ = stop_tun(runtime);
@@ -1429,7 +1417,6 @@ fn flush_dns_cache() {
         .output();
 }
 
-#[cfg(feature = "verbose-logs")]
 fn log_tun_network_state(label: &str) {
     helper_log!("[NulConnect][Helper][Tun][Diag] {label}");
     log_command_output(
@@ -1482,10 +1469,6 @@ fn log_tun_network_state(label: &str) {
     );
 }
 
-#[cfg(not(feature = "verbose-logs"))]
-fn log_tun_network_state(_label: &str) {}
-
-#[cfg(feature = "verbose-logs")]
 fn log_command_output(label: &str, command: &mut Command, stdin_data: Option<&[u8]>) {
     let output = if let Some(stdin_data) = stdin_data {
         match command.spawn() {
