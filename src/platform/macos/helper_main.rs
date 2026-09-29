@@ -905,16 +905,10 @@ fn reset_dns_to_default() {
 }
 
 fn cleanup_tun_routes() {
-    helper_log!("[NulConnect][Helper][Tun] cleanup managed/fake-ip routes");
-    let _ = Command::new("/sbin/route")
-        .args(["-n", "delete", "-net", "198.18.0.0/15"])
-        .output();
-    let _ = Command::new("/sbin/route")
-        .args(["-n", "delete", "-net", "198.18.0.0/16"])
-        .output();
-    let _ = Command::new("/sbin/route")
-        .args(["-n", "delete", "-host", "198.18.0.1"])
-        .output();
+    // Only routes recorded in the state file are ours to remove. Older
+    // versions also deleted 198.18.0.0/15, /16 and 198.18.0.1 blindly, which
+    // could tear down another tool's fake-IP routes (Clash uses 198.18.0.0/16).
+    helper_log!("[NulConnect][Helper][Tun] cleanup managed routes");
     let state_path = managed_routes_state_path();
     if let Ok(data) = fs::read_to_string(&state_path)
         && let Ok(routes) = serde_json::from_str::<Vec<String>>(&data)
