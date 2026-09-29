@@ -801,6 +801,19 @@ fn handle_request(runtime: &Arc<WindowsRuntime>, request: &[u8], allow_shutdown:
             runtime.cleanup_leftovers();
             ok(json!({ "status": "clean" }))
         }
+        "set_logging" => {
+            let enabled = request
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            reatrust::set_log_directory(crate::platform::windows_log::log_dir());
+            reatrust::set_verbose_logging(enabled);
+            crate::helper_log!(
+                "[IPC] verbose logging {}",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            ok(json!({ "logging": enabled }))
+        }
         "shutdown" if allow_shutdown => {
             runtime.request_shutdown();
             ok(json!({ "status": "stopping" }))

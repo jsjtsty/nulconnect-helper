@@ -380,6 +380,7 @@ fn uninstall() -> Result<(), String> {
         }
     }
     let _ = std::fs::remove_dir_all(target_dir.join("state"));
+    let _ = std::fs::remove_dir_all(crate::platform::windows_log::state_dir());
     let _ = std::fs::remove_dir(&target_dir);
     if let Some(parent) = target_dir.parent() {
         let _ = std::fs::remove_dir(parent);
