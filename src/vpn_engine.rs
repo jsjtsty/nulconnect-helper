@@ -437,6 +437,7 @@ fn spawn_tun_to_l3(
             let mut read_packets = 0usize;
             let mut written_packets = 0usize;
             let mut samples = 0usize;
+            let mut ipv6_dropped = 0usize;
             let mut buf = vec![0u8; 65_535];
             while !close.load(Ordering::SeqCst) {
                 match device.receive(&mut buf) {
@@ -452,6 +453,16 @@ fn spawn_tun_to_l3(
                                 &mut samples,
                                 packet_information,
                             );
+                            // The tunnel is IPv4-only. The OS still sends IPv6 on the
+                            // interface (neighbour discovery, mDNS, ...); dropping it
+                            // is the only correct handling and must never be fatal.
+                            if is_ipv6_packet(packet) {
+                                ipv6_dropped += 1;
+                                if ipv6_dropped == 1 {
+                                    helper_debug_log("uplink: dropping IPv6 packets (unsupported)");
+                                }
+                                continue;
+                            }
                             if protocol_stack.accept_packet(packet.to_vec()) {
                                 continue;
                             }
@@ -474,10 +485,12 @@ fn spawn_tun_to_l3(
                                         ));
                                     }
                                 }
-                                Err(AtrError::NotFound(message)) => {
-                                    helper_debug_log(&format!(
-                                        "uplink packet route not found: {message}"
-                                    ));
+                                Err(err) if is_packet_local_error(&err) => {
+                                    // This packet cannot be carried (unmanaged
+                                    // destination, IPv6, an IP protocol the tunnel
+                                    // does not know, a malformed header). The tunnel
+                                    // itself is fine, so only this packet is lost.
+                                    helper_debug_log(&format!("uplink packet dropped: {err}"));
                                 }
                                 Err(err) if !exit_on_fatal_error => {
                                     helper_debug_log(&format!(
@@ -491,8 +504,7 @@ fn spawn_tun_to_l3(
                                 }
                             }
                         }
-                        Err(AtrError::NotFound(_)) => {}
-                        Err(err) if !exit_on_fatal_error => {
+                        Err(err) if is_packet_local_error(&err) || !exit_on_fatal_error => {
                             helper_debug_log(&format!("uplink packet ignored: {err}"));
                         }
                         Err(err) => {
@@ -610,6 +622,22 @@ fn spawn_l3_to_tun(
             }
         })
         .map_err(|err| AtrError::Internal(format!("failed to start L3 downlink worker: {err}")))
+}
+
+fn is_ipv6_packet(packet: &[u8]) -> bool {
+    packet.first().is_some_and(|byte| byte >> 4 == 6)
+}
+
+/// Errors about one packet rather than about the tunnel. They must not stop the
+/// engine: real traffic contains packets the tunnel cannot carry.
+fn is_packet_local_error(err: &AtrError) -> bool {
+    matches!(
+        err,
+        AtrError::NotFound(_)
+            | AtrError::Unsupported(_)
+            | AtrError::ParseFailed(_)
+            | AtrError::InvalidArgument(_)
+    )
 }
 
 fn strip_packet_information(packet: &[u8], enabled: bool) -> AtrResult<&[u8]> {
@@ -802,5 +830,39 @@ impl From<VpnCookieRecord> for CookieRecord {
 fn helper_debug_log(message: &str) {
     if reatrust::verbose_logging_enabled() {
         reatrust::log_write(&format!("[NulConnect][L3] {message}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_packets_are_recognised_by_version_nibble() {
+        assert!(is_ipv6_packet(&[0x60, 0, 0, 0]));
+        assert!(is_ipv6_packet(&[0x6e, 0]));
+        assert!(!is_ipv6_packet(&[0x45, 0]));
+        assert!(!is_ipv6_packet(&[]));
+    }
+
+    #[test]
+    fn per_packet_errors_are_not_fatal_but_tunnel_errors_are() {
+        for err in [
+            AtrError::Unsupported("only ipv4 is supported".into()),
+            AtrError::ParseFailed("packet too short".into()),
+            AtrError::InvalidArgument("x".into()),
+            AtrError::NotFound("resource not managed".into()),
+        ] {
+            assert!(is_packet_local_error(&err), "{err}");
+        }
+        for err in [
+            AtrError::NetworkFailed("broken pipe".into()),
+            AtrError::Unauthorized("session expired".into()),
+            AtrError::InvalidState("closed".into()),
+            AtrError::CryptoFailed("x".into()),
+            AtrError::Internal("x".into()),
+        ] {
+            assert!(!is_packet_local_error(&err), "{err}");
+        }
     }
 }
