@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use nulconnect_helper::{
-    AtrError, AtrResult, VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnEngineStatus,
-    VpnSessionMaterial,
+    AtrError, AtrResult, FAKE_IP_CIDR, FakeIpConfig, VpnCookieRecord, VpnEngine, VpnEngineConfig,
+    VpnEngineStatus, VpnSessionMaterial,
 };
 use reatrust::{ClientConfig, parse_resource_bytes};
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,13 @@ struct HelperConfig {
     mtu: u16,
     setup_routes: bool,
     exit_on_fatal_error: bool,
+    /// Answer managed domains with fake addresses (see the `fake_dns` module).
+    #[serde(default = "default_true")]
+    fake_ip: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -611,14 +618,18 @@ fn start_tun_worker(runtime: &HelperRuntime, config: HelperConfig) -> AtrResult<
             return Err(err);
         }
     };
-    if let Err(err) = setup_managed_tun_routes(&config, &tun_name) {
+    let fake_dns = engine.fake_dns_addr();
+    if let Some(addr) = fake_dns {
+        helper_log!("[NulConnect][Helper][Tun] fake-IP DNS listening on {addr}");
+    }
+    if let Err(err) = setup_managed_tun_routes(&config, &tun_name, fake_dns) {
         helper_log!("[NulConnect][Helper][Tun] worker: route setup failed: {err}");
         let _ = engine.stop();
         restore_tun_network_after_stop(runtime);
         return Err(err);
     }
     helper_log!("[NulConnect][Helper][Tun] worker: route setup complete");
-    if let Err(err) = wait_for_tun_setup(&config, &tun_name) {
+    if let Err(err) = wait_for_tun_setup(&config, &tun_name, fake_dns) {
         helper_log!("[NulConnect][Helper][Tun] worker: setup wait failed: {err}");
         let _ = engine.stop();
         restore_tun_network_after_stop(runtime);
@@ -915,7 +926,11 @@ fn cleanup_tun_routes() {
     let _ = fs::remove_file(state_path);
 }
 
-fn setup_managed_tun_routes(config: &HelperConfig, tun_name: &str) -> AtrResult<()> {
+fn setup_managed_tun_routes(
+    config: &HelperConfig,
+    tun_name: &str,
+    fake_dns: Option<std::net::SocketAddr>,
+) -> AtrResult<()> {
     if !config.setup_routes {
         helper_log!("[NulConnect][Helper][Tun] managed route setup skipped");
         return Ok(());
@@ -925,9 +940,12 @@ fn setup_managed_tun_routes(config: &HelperConfig, tun_name: &str) -> AtrResult<
     // the connection was interrupted. Remove only routes recorded as ours
     // before calculating the new route set.
     cleanup_tun_routes();
-    configure_scoped_dns_resolvers(&config.managed_domains, &config.dns_addr)?;
+    configure_scoped_dns_resolvers(&config.managed_domains, &config.dns_addr, fake_dns)?;
 
     let mut routes = config.managed_route_cidrs.clone();
+    if fake_dns.is_some() {
+        routes.push(FAKE_IP_CIDR.to_string());
+    }
     if should_route_dns_via_tun(&config.dns_addr) {
         routes.push(format!("{}/32", config.dns_addr.trim()));
     } else if !config.dns_addr.trim().is_empty() {
@@ -1108,20 +1126,43 @@ fn discover_tun_name() -> AtrResult<String> {
     ))
 }
 
-fn configure_scoped_dns_resolvers(domains: &[String], server: &str) -> AtrResult<()> {
+/// First line of every resolver file this helper writes. Files carrying it are
+/// ours even when their content (the port changes per run) differs from what
+/// the current run would write.
+const RESOLVER_MARKER: &str = "# managed by NulConnect";
+
+fn resolver_contents(server: &str, fake_dns: Option<std::net::SocketAddr>) -> String {
+    match fake_dns {
+        Some(addr) => format!(
+            "{RESOLVER_MARKER}\nnameserver {}\nport {}\n",
+            addr.ip(),
+            addr.port()
+        ),
+        None => format!("{RESOLVER_MARKER}\nnameserver {}\n", server.trim()),
+    }
+}
+
+fn configure_scoped_dns_resolvers(
+    domains: &[String],
+    server: &str,
+    fake_dns: Option<std::net::SocketAddr>,
+) -> AtrResult<()> {
     cleanup_scoped_dns_resolvers();
     let resolver_dir = Path::new("/etc/resolver");
     fs::create_dir_all(resolver_dir)?;
 
-    let contents = format!("nameserver {}\n", server.trim());
+    let contents = resolver_contents(server, fake_dns);
+    // Files written by earlier helper versions had no marker.
+    let legacy_contents = format!("nameserver {}\n", server.trim());
     let mut installed = Vec::new();
     for domain in normalized_resolver_domains(domains) {
         let path = resolver_dir.join(&domain);
         // Our own files were removed above; anything still there belongs to
         // the user or another VPN and must survive connect/disconnect. A
-        // file identical to ours is a leftover from an interrupted run.
+        // marked or legacy-identical file is a leftover from an interrupted run.
         if let Ok(existing) = fs::read_to_string(&path)
-            && existing != contents
+            && !existing.starts_with(RESOLVER_MARKER)
+            && existing != legacy_contents
         {
             helper_log!(
                 "[NulConnect][Helper][Tun] keeping existing resolver {}",
@@ -1132,7 +1173,7 @@ fn configure_scoped_dns_resolvers(domains: &[String], server: &str) -> AtrResult
         helper_log!(
             "[NulConnect][Helper][Tun] set scoped DNS resolver {} -> {}",
             path.display(),
-            server
+            contents.replace('\n', " | ")
         );
         fs::write(&path, &contents)?;
         installed.push(domain);
@@ -1257,7 +1298,11 @@ fn managed_routes_state_path() -> PathBuf {
     PathBuf::from(DEFAULT_STATE_DIR).join("tun-managed-routes.json")
 }
 
-fn wait_for_tun_setup(config: &HelperConfig, tun_name: &str) -> AtrResult<()> {
+fn wait_for_tun_setup(
+    config: &HelperConfig,
+    tun_name: &str,
+    fake_dns: Option<std::net::SocketAddr>,
+) -> AtrResult<()> {
     if !config.setup_routes {
         return Ok(());
     }
@@ -1270,9 +1315,12 @@ fn wait_for_tun_setup(config: &HelperConfig, tun_name: &str) -> AtrResult<()> {
         .iter()
         .map(String::as_str)
         .collect();
+    if fake_dns.is_some() {
+        pending_routes.push(FAKE_IP_CIDR);
+    }
     while std::time::Instant::now() < deadline {
         pending_routes.retain(|cidr| !tun_route_ready_for_cidr(cidr, tun_name));
-        let dns_ready = scoped_dns_ready(&config.dns_addr);
+        let dns_ready = scoped_dns_ready(&config.dns_addr, fake_dns);
 
         if pending_routes.is_empty() && dns_ready {
             helper_log!("[NulConnect][Helper][Tun] setup ready: route=true dns=true");
@@ -1300,7 +1348,7 @@ fn tun_route_ready_for_cidr(cidr: &str, tun_name: &str) -> bool {
 
 /// Checks the resolver files this helper installed; domains skipped because
 /// the user already has their own resolver file are not expected.
-fn scoped_dns_ready(server: &str) -> bool {
+fn scoped_dns_ready(server: &str, fake_dns: Option<std::net::SocketAddr>) -> bool {
     let domains = fs::read_to_string(scoped_dns_state_path())
         .ok()
         .and_then(|data| serde_json::from_str::<Vec<String>>(&data).ok())
@@ -1308,7 +1356,10 @@ fn scoped_dns_ready(server: &str) -> bool {
     if domains.is_empty() {
         return true;
     }
-    let expected = format!("nameserver {}", server.trim());
+    let expected = match fake_dns {
+        Some(addr) => format!("nameserver {}", addr.ip()),
+        None => format!("nameserver {}", server.trim()),
+    };
     domains.iter().all(|domain| {
         let path = Path::new("/etc/resolver").join(domain);
         fs::read_to_string(path)
@@ -1525,6 +1576,18 @@ impl HelperConfig {
         let resource_bytes = base64::engine::general_purpose::STANDARD
             .decode(self.resource_bytes.as_bytes())
             .map_err(|err| AtrError::ParseFailed(format!("invalid resource_bytes: {err}")))?;
+        let fake_ip =
+            (self.fake_ip && self.setup_routes && !self.managed_domains.is_empty()).then(|| {
+                FakeIpConfig {
+                    bind: std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                    upstream: self
+                        .dns_addr
+                        .trim()
+                        .parse::<Ipv4Addr>()
+                        .ok()
+                        .map(|ip| std::net::SocketAddr::from((ip, 53))),
+                }
+            });
         Ok(VpnEngineConfig {
             client: self.client.into(),
             session: self.session.into(),
@@ -1534,6 +1597,7 @@ impl HelperConfig {
             mtu: self.mtu,
             packet_information: false,
             exit_on_fatal_error: self.exit_on_fatal_error,
+            fake_ip,
         })
     }
 }
@@ -1988,9 +2052,22 @@ fn now_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyEndpoint, is_valid_dns_server, normalized_resolver_domains, parse_ipv4_cidr,
-        validate_pac_url,
+        ProxyEndpoint, RESOLVER_MARKER, is_valid_dns_server, normalized_resolver_domains,
+        parse_ipv4_cidr, resolver_contents, validate_pac_url,
     };
+
+    #[test]
+    fn resolver_files_are_marked_and_point_at_the_local_dns_port() {
+        let fake = resolver_contents("10.0.0.53", Some("127.0.0.1:53535".parse().unwrap()));
+        assert!(fake.starts_with(RESOLVER_MARKER));
+        assert!(fake.contains("nameserver 127.0.0.1\n"));
+        assert!(fake.contains("port 53535\n"));
+
+        let plain = resolver_contents("10.0.0.53", None);
+        assert!(plain.starts_with(RESOLVER_MARKER));
+        assert!(plain.contains("nameserver 10.0.0.53\n"));
+        assert!(!plain.contains("port"));
+    }
 
     #[test]
     fn dns_server_accepts_ipv4_and_scoped_ipv6_only() {

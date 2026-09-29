@@ -7,6 +7,7 @@
 //! protocols, and resources that are not managed by the VPN.
 
 use crate::error::{AtrError, AtrResult};
+use crate::fake_dns::FakeIpPool;
 use crate::vpn_engine::{TunIo, add_packet_information};
 use reatrust::{AtrClient, L3Tunnel, RouteDecision, TcpTunnel, UdpTunnel};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -49,6 +50,7 @@ enum StackEvent {
 pub(crate) struct TunProtocolStack {
     input: Sender<StackEvent>,
     client: AtrClient,
+    fake_pool: Option<Arc<FakeIpPool>>,
     close: Arc<AtomicBool>,
     worker: std::sync::Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -57,6 +59,7 @@ impl TunProtocolStack {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         client: AtrClient,
+        fake_pool: Option<Arc<FakeIpPool>>,
         local_ip: Ipv4Addr,
         device: Arc<dyn TunIo>,
         close: Arc<AtomicBool>,
@@ -74,6 +77,7 @@ impl TunProtocolStack {
         };
         let worker_close = close.clone();
         let worker_client = client.clone();
+        let worker_pool = fake_pool.clone();
         let worker = thread::Builder::new()
             .name("nulconnect-tun-transports".into())
             .spawn(move || {
@@ -86,6 +90,7 @@ impl TunProtocolStack {
                     input_rx,
                     waker,
                     worker_client,
+                    worker_pool,
                     upload_bytes,
                     upload_packets,
                     download_bytes,
@@ -98,6 +103,7 @@ impl TunProtocolStack {
         Ok(Self {
             input,
             client,
+            fake_pool,
             close,
             worker: std::sync::Mutex::new(Some(worker)),
         })
@@ -109,6 +115,19 @@ impl TunProtocolStack {
         let Some((protocol, destination, port)) = ipv4_protocol_and_port(&packet) else {
             return false;
         };
+        // Fake addresses stand for domain resources and are never routable
+        // by address. TCP goes to the stack, which resolves the domain when
+        // the connection is opened and resets it if the domain is not
+        // managed for that port. Nothing else can be carried by name.
+        if self.fake_pool.is_some() && FakeIpPool::contains(destination) {
+            if protocol == 6 {
+                return self.input.send(StackEvent::Packet(packet)).is_ok();
+            }
+            reatrust::log_write(&format!(
+                "[NulConnect][FakeDNS] dropped protocol {protocol} packet to fake address {destination}:{port}"
+            ));
+            return true;
+        }
         let managed = match protocol {
             6 => matches!(
                 self.client.route_tcp(&destination.to_string(), port),
@@ -311,6 +330,7 @@ fn run_transport_stack(
     input_rx: Receiver<StackEvent>,
     waker: StackWaker,
     client: AtrClient,
+    fake_pool: Option<Arc<FakeIpPool>>,
     upload_bytes: Arc<AtomicU64>,
     upload_packets: Arc<AtomicU64>,
     download_bytes: Arc<AtomicU64>,
@@ -380,6 +400,7 @@ fn run_transport_stack(
         let _ = iface.poll(smoltcp_now(), &mut phy, &mut sockets);
         process_tcp(
             &client,
+            fake_pool.as_deref(),
             &mut sockets,
             &mut tcp_listeners,
             &mut tcp_flows,
@@ -572,6 +593,7 @@ fn ensure_udp_listener(
 #[allow(clippy::too_many_arguments)]
 fn process_tcp(
     client: &AtrClient,
+    fake_pool: Option<&FakeIpPool>,
     sockets: &mut SocketSet<'static>,
     listeners: &mut Listeners,
     flows: &mut HashMap<SocketHandle, TcpFlow>,
@@ -594,7 +616,12 @@ fn process_tcp(
         };
         let (connect_tx, connect_rx) = mpsc::channel();
         let client = client.clone();
-        let target = target_ip.to_string();
+        // A fake address stands for a domain: connect by name so the gateway
+        // resolves it. An address whose mapping is gone stays an IP string and
+        // is refused by the route check below.
+        let target = fake_pool
+            .and_then(|pool| pool.domain_for(target_ip))
+            .unwrap_or_else(|| target_ip.to_string());
         let connect_waker = waker.clone();
         thread::spawn(move || {
             let result = match client.route_tcp(&target, target_port) {

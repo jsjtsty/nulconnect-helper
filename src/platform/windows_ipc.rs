@@ -340,6 +340,8 @@ impl WindowsRuntime {
             mtu: config.mtu,
             packet_information: false,
             exit_on_fatal_error: config.exit_on_fatal_error,
+            // Fake-IP DNS is not wired into the Windows resolver setup yet.
+            fake_ip: None,
         };
 
         crate::helper_log!("[Tun] starting L3 engine");

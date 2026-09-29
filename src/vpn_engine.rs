@@ -1,10 +1,11 @@
 use crate::error::{AtrError, AtrResult};
+use crate::fake_dns::{FakeDnsServer, FakeIpPool};
 use crate::tun_stack::TunProtocolStack;
 use reatrust::{
     AtrClient, ClientConfig, CookieRecord, L3Tunnel, SessionMaterial, parse_resource_bytes,
 };
 use std::io::ErrorKind;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -32,6 +33,15 @@ pub struct VpnSessionMaterial {
     pub cookies: Vec<VpnCookieRecord>,
 }
 
+/// Fake-IP DNS for domain-based resources (see `fake_dns`).
+#[derive(Debug, Clone)]
+pub struct FakeIpConfig {
+    /// Where the DNS server listens; port 0 picks a free port.
+    pub bind: SocketAddr,
+    /// Resolver that receives queries the server does not answer itself.
+    pub upstream: Option<SocketAddr>,
+}
+
 #[derive(Debug, Clone)]
 pub struct VpnEngineConfig {
     pub client: ClientConfig,
@@ -42,6 +52,7 @@ pub struct VpnEngineConfig {
     pub mtu: u16,
     pub packet_information: bool,
     pub exit_on_fatal_error: bool,
+    pub fake_ip: Option<FakeIpConfig>,
 }
 
 impl Default for VpnEngineConfig {
@@ -62,6 +73,7 @@ impl Default for VpnEngineConfig {
             mtu: 1400,
             packet_information: false,
             exit_on_fatal_error: true,
+            fake_ip: None,
         }
     }
 }
@@ -131,6 +143,7 @@ struct VpnEngineImpl {
     interrupt: Arc<InterruptEvent>,
     tunnel: Arc<L3Tunnel>,
     protocol_stack: Option<Arc<TunProtocolStack>>,
+    fake_dns: Option<FakeDnsServer>,
     result: Arc<Mutex<Option<AtrResult<usize>>>>,
     upload_bytes: Arc<AtomicU64>,
     download_bytes: Arc<AtomicU64>,
@@ -157,7 +170,15 @@ impl VpnEngine {
         }
         #[cfg(not(target_os = "windows"))]
         let _ = self.inner.interrupt.trigger();
+        if let Some(server) = &self.inner.fake_dns {
+            server.stop();
+        }
         let _ = self.inner.tunnel.close();
+    }
+
+    /// Address of the fake-IP DNS server, when one is running.
+    pub fn fake_dns_addr(&self) -> Option<SocketAddr> {
+        self.inner.fake_dns.as_ref().map(FakeDnsServer::local_addr)
     }
 
     /// Name of the TUN interface carrying the VPN (e.g. `utun5`).
@@ -222,8 +243,26 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
     let upload_packets = Arc::new(AtomicU64::new(0));
     let download_packets = Arc::new(AtomicU64::new(0));
 
+    let fake_pool = config
+        .fake_ip
+        .as_ref()
+        .map(|_| Arc::new(FakeIpPool::default()));
+    let fake_dns = match (&config.fake_ip, &fake_pool) {
+        (Some(fake_ip), Some(pool)) => Some(
+            FakeDnsServer::start(
+                fake_ip.bind,
+                Arc::new(client.clone()),
+                pool.clone(),
+                fake_ip.upstream,
+            )
+            .map_err(|err| AtrError::NetworkFailed(format!("fake-IP DNS server: {err}")))?,
+        ),
+        _ => None,
+    };
+
     let protocol_stack = Arc::new(TunProtocolStack::start(
         client,
+        fake_pool,
         local_ip,
         device.clone(),
         close.clone(),
@@ -270,6 +309,7 @@ fn start_l3_vpn_engine(config: VpnEngineConfig) -> AtrResult<VpnEngine> {
             interrupt,
             tunnel,
             protocol_stack: Some(protocol_stack),
+            fake_dns,
             result,
             upload_bytes,
             download_bytes,

@@ -1,4 +1,5 @@
 mod error;
+mod fake_dns;
 mod tun_stack;
 mod vpn_engine;
 
@@ -6,7 +7,8 @@ mod vpn_engine;
 pub mod platform;
 
 pub use error::{AtrError, AtrResult, ErrorCode};
+pub use fake_dns::FAKE_IP_CIDR;
 pub use vpn_engine::{
-    VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnEngineStatus, VpnEngineTrafficStats,
-    VpnSessionMaterial,
+    FakeIpConfig, VpnCookieRecord, VpnEngine, VpnEngineConfig, VpnEngineStatus,
+    VpnEngineTrafficStats, VpnSessionMaterial,
 };
