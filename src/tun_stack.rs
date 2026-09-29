@@ -36,6 +36,8 @@ const UDP_FLOW_IDLE_TIMEOUT_MS: u64 = 60_000;
 const UDP_PENDING_DATAGRAMS: usize = 32;
 /// Upper bound for the idle wait of the stack loop; also bounds how late the
 /// close flag and UDP idle reaping are noticed.
+/// How long an app may take to complete the TCP handshake with the local stack.
+const HANDSHAKE_TIMEOUT_MS: u64 = 30_000;
 const MAX_IDLE_WAIT: Duration = Duration::from_millis(250);
 /// Listeners for destinations without traffic for this long are dropped to
 /// release their buffers; they are re-created by the next packet.
@@ -262,6 +264,8 @@ impl StackWaker {
 struct TcpFlow {
     /// `host:port` the flow was opened for, used in diagnostics.
     label: String,
+    /// When the app's SYN was accepted (milliseconds, `now_millis`).
+    started_ms: u64,
     remote: Option<Arc<TcpTunnel>>,
     /// Data read from the tunnel; `None` until the tunnel is connected.
     remote_rx: Option<Receiver<Vec<u8>>>,
@@ -648,6 +652,7 @@ fn process_tcp(
             handle,
             TcpFlow {
                 label: format!("{target_label}:{target_port}"),
+                started_ms: now_millis(),
                 remote: None,
                 remote_rx: None,
                 download_pending: None,
@@ -707,7 +712,12 @@ fn process_tcp(
             deliver_download(flow, socket, download_bytes);
         }
 
-        if socket.state() == tcp::State::Closed || (!socket.may_recv() && !socket.may_send()) {
+        if tcp_flow_finished(
+            socket.state(),
+            socket.may_recv(),
+            socket.may_send(),
+            now_millis().saturating_sub(flow.started_ms),
+        ) {
             flow.closed.store(true, Ordering::SeqCst);
         }
     }
@@ -728,6 +738,18 @@ fn process_tcp(
             close_in_background(flow.remote);
         }
         let _ = sockets.remove(handle);
+    }
+}
+
+/// A flow whose app-side handshake is still running can neither send nor
+/// receive yet, so "neither direction open" only means finished once the
+/// handshake is over. A handshake that never completes is given up after
+/// [`HANDSHAKE_TIMEOUT_MS`] so half-open sockets cannot pile up.
+fn tcp_flow_finished(state: tcp::State, may_recv: bool, may_send: bool, age_ms: u64) -> bool {
+    match state {
+        tcp::State::Closed => true,
+        tcp::State::SynReceived | tcp::State::SynSent => age_ms > HANDSHAKE_TIMEOUT_MS,
+        _ => !may_recv && !may_send,
     }
 }
 
@@ -1069,16 +1091,41 @@ mod tests {
     use super::UDP_FLOW_IDLE_TIMEOUT_MS;
     use super::ipv4_protocol_and_port;
     use super::udp_flow_expired;
-    use super::{TcpFlow, deliver_download};
+    use super::{HANDSHAKE_TIMEOUT_MS, TcpFlow, deliver_download, tcp_flow_finished};
     use smoltcp::iface::{Config, Interface, SocketSet};
     use smoltcp::phy::{Loopback, Medium};
     use smoltcp::socket::tcp;
+    use smoltcp::socket::tcp::State;
     use smoltcp::time::Instant as SmoltcpInstant;
     use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
     use std::sync::mpsc;
+
+    #[test]
+    fn a_flow_is_not_finished_while_its_handshake_is_running() {
+        // Regression: SYN-RECEIVED has neither send nor receive open, and
+        // treating that as "finished" killed every flow at birth.
+        assert!(!tcp_flow_finished(State::SynReceived, false, false, 0));
+        assert!(!tcp_flow_finished(State::SynSent, false, false, 1_000));
+        assert!(tcp_flow_finished(
+            State::SynReceived,
+            false,
+            false,
+            HANDSHAKE_TIMEOUT_MS + 1
+        ));
+    }
+
+    #[test]
+    fn established_and_closing_flows_are_judged_by_open_directions() {
+        assert!(!tcp_flow_finished(State::Established, true, true, 0));
+        assert!(!tcp_flow_finished(State::CloseWait, false, true, 0));
+        assert!(!tcp_flow_finished(State::FinWait2, true, false, 0));
+        assert!(tcp_flow_finished(State::LastAck, false, false, 0));
+        assert!(tcp_flow_finished(State::TimeWait, false, false, 0));
+        assert!(tcp_flow_finished(State::Closed, false, false, 0));
+    }
 
     #[test]
     fn download_survives_partial_writes_and_ends_with_fin() {
@@ -1122,6 +1169,7 @@ mod tests {
         });
         let mut flow = TcpFlow {
             label: "test:0".into(),
+            started_ms: 0,
             remote: None,
             remote_rx: Some(rx),
             download_pending: None,
