@@ -3,7 +3,11 @@
 [![CI](https://github.com/jsjtsty/nulconnect-helper/actions/workflows/ci.yml/badge.svg)](https://github.com/jsjtsty/nulconnect-helper/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPLv3-blue.svg)](LICENSE.txt)
 
-`nulconnect-helper` is the privileged platform helper used by NulConnect. It provides the operating-system integration required for local proxying, TUN/VPN operation, and privileged network configuration while keeping those operations outside the desktop application process.
+`nulconnect-helper` is the privileged platform helper of [NulConnect](https://github.com/jsjtsty/NulConnect), a third-party, open-source client for **Sangfor aTrust** (深信服 aTrust) zero-trust access services. It provides the operating-system integration required for local proxying, TUN/VPN operation, and privileged network configuration while keeping those operations outside the desktop application process.
+
+> **Disclaimer:** This is an unofficial project. It is not affiliated with, endorsed by, or supported by Sangfor Technologies. "aTrust" and "Sangfor" are trademarks of their respective owners.
+
+[简体中文](README.zh-CN.md)
 
 ## Responsibilities
 
@@ -63,8 +67,8 @@ GitHub Actions runs these checks and builds platform-specific artifacts. Release
 
 ## Related projects
 
-- [NulConnect](https://github.com/jsjtsty/NulConnect) — macOS desktop client
-- [libreatrust](https://github.com/jsjtsty/libreatrust) — Rust transport and authentication library
+- [NulConnect](https://github.com/jsjtsty/NulConnect) — macOS aTrust client
+- [libreatrust](https://github.com/jsjtsty/libreatrust) — Rust aTrust protocol, authentication, and transport library
 
 ## License
 
