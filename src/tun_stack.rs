@@ -260,6 +260,8 @@ impl StackWaker {
 }
 
 struct TcpFlow {
+    /// `host:port` the flow was opened for, used in diagnostics.
+    label: String,
     remote: Option<Arc<TcpTunnel>>,
     /// Data read from the tunnel; `None` until the tunnel is connected.
     remote_rx: Option<Receiver<Vec<u8>>>,
@@ -622,6 +624,7 @@ fn process_tcp(
         let target = fake_pool
             .and_then(|pool| pool.domain_for(target_ip))
             .unwrap_or_else(|| target_ip.to_string());
+        let target_label = target.clone();
         let connect_waker = waker.clone();
         thread::spawn(move || {
             let result = match client.route_tcp(&target, target_port) {
@@ -644,6 +647,7 @@ fn process_tcp(
         flows.insert(
             handle,
             TcpFlow {
+                label: format!("{target_label}:{target_port}"),
                 remote: None,
                 remote_rx: None,
                 download_pending: None,
@@ -715,6 +719,12 @@ fn process_tcp(
         .collect();
     for handle in dead {
         if let Some(flow) = flows.remove(&handle) {
+            reatrust::log_write(&format!(
+                "[NulConnect][Stack] {}: flow closed (socket state {}, tunnel eof={})",
+                flow.label,
+                sockets.get::<tcp::Socket>(handle).state(),
+                flow.remote_eof
+            ));
             close_in_background(flow.remote);
         }
         let _ = sockets.remove(handle);
@@ -727,12 +737,31 @@ fn start_tcp_flow_threads(flow: &mut TcpFlow, remote: &Arc<TcpTunnel>, waker: &S
     let reader_waker = waker.clone();
     let (incoming_tx, incoming_rx) = mpsc::sync_channel(FLOW_CHANNEL_CAPACITY);
     flow.remote_rx = Some(incoming_rx);
+    let reader_label = flow.label.clone();
     thread::spawn(move || {
         let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
         while !reader_closed.load(Ordering::SeqCst) {
             match reader_remote.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    reatrust::log_write(&format!(
+                        "[NulConnect][Stack] {reader_label}: tunnel closed the stream after {total} bytes down"
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    reatrust::log_write(&format!(
+                        "[NulConnect][Stack] {reader_label}: tunnel read failed after {total} bytes down: {err}"
+                    ));
+                    break;
+                }
                 Ok(n) => {
+                    if total == 0 {
+                        reatrust::log_write(&format!(
+                            "[NulConnect][Stack] {reader_label}: first {n} bytes from tunnel"
+                        ));
+                    }
+                    total += n;
                     if incoming_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
@@ -750,11 +779,23 @@ fn start_tcp_flow_threads(flow: &mut TcpFlow, remote: &Arc<TcpTunnel>, waker: &S
         let writer_closed = flow.closed.clone();
         let writer_pending = flow.upload_pending.clone();
         let writer_waker = waker.clone();
+        let writer_label = flow.label.clone();
         thread::spawn(move || {
+            let mut total = 0usize;
             while !writer_closed.load(Ordering::SeqCst) {
                 match write_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(data) => {
-                        if writer_remote.write(&data).is_err() {
+                        if total == 0 {
+                            reatrust::log_write(&format!(
+                                "[NulConnect][Stack] {writer_label}: first {} bytes to tunnel",
+                                data.len()
+                            ));
+                        }
+                        total += data.len();
+                        if let Err(err) = writer_remote.write(&data) {
+                            reatrust::log_write(&format!(
+                                "[NulConnect][Stack] {writer_label}: tunnel write failed after {total} bytes up: {err}"
+                            ));
                             writer_closed.store(true, Ordering::SeqCst);
                             writer_waker.wake();
                             break;
@@ -1080,6 +1121,7 @@ mod tests {
             }
         });
         let mut flow = TcpFlow {
+            label: "test:0".into(),
             remote: None,
             remote_rx: Some(rx),
             download_pending: None,
