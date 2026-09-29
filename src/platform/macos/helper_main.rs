@@ -1541,7 +1541,7 @@ fn log_command_output(label: &str, command: &mut Command, stdin_data: Option<&[u
             } else {
                 stdout.trim()
             };
-            let first_lines = text.lines().take(24).collect::<Vec<_>>().join(" | ");
+            let first_lines = text.lines().take(400).collect::<Vec<_>>().join(" | ");
             helper_log!("[NulConnect][Helper][Tun][Diag] {label}: {first_lines}");
         }
         Err(err) => {

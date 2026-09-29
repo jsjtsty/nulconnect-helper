@@ -632,6 +632,11 @@ fn process_tcp(
                     "resource not managed for {target}:{target_port}"
                 ))),
             };
+            if let Err(err) = &result {
+                reatrust::log_write(&format!(
+                    "[NulConnect][Stack] tcp connect {target}:{target_port} (via {target_ip}) failed: {err}"
+                ));
+            }
             let _ = connect_tx.send(result);
             connect_waker.wake();
         });

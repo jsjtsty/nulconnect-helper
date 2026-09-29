@@ -313,6 +313,9 @@ fn serve(
         };
         let query = &buf[..len];
         let Some(question) = parse_query(query) else {
+            dns_log(&format!(
+                "ignored unparsable query ({len} bytes) from {peer}"
+            ));
             continue;
         };
         match decide(policy.as_ref(), &pool, &question) {
@@ -328,6 +331,10 @@ fn serve(
                 let _ = socket.send_to(&build_response(query, &question, 0, &[]), peer);
             }
             Decision::Forward => {
+                dns_log(&format!(
+                    "{} type {} -> forward to {upstream:?}",
+                    question.name, question.qtype
+                ));
                 let Some(upstream) = upstream else {
                     let _ = socket.send_to(&build_response(query, &question, 2, &[]), peer);
                     continue;
