@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "nulconnect-helper"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "base64",
  "libc",
